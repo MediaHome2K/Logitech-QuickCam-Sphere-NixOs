@@ -34,7 +34,7 @@ Le modèle et ses conditions de redistribution sont distincts du code de ce dép
 
 ## Installation et premier lancement
 
-Les exemples ci-dessous utilisent le fichier **v0.7** fourni, `follow_me_7.py`. Si le dépôt publie la version sélectionnée sous le nom `follow_me.py`, remplacez ce nom dans les commandes. La dernière version peut relancer automatiquement un shell Nix sur NixOS en cas de dépendances absentes ; hors NixOS, installez vous-même les dépendances système et Python ci-dessus.
+Les exemples ci-dessous utilisent le fichier **v0.7** fourni, `follow-me-QuickCam-NixOs.py`. Si le dépôt publie la version sélectionnée sous le nom `follow_me.py`, remplacez ce nom dans les commandes. La dernière version peut relancer automatiquement un shell Nix sur NixOS en cas de dépendances absentes ; hors NixOS, installez vous-même les dépendances système et Python ci-dessus.
 
 Vérifiez d’abord les périphériques identifiés :
 
@@ -46,7 +46,7 @@ v4l2-ctl --device /dev/v4l/by-id/VOTRE-PERIPHERIQUE-video-index0 --list-ctrls
 Démarrez avec un chemin stable `/dev/v4l/by-id/...` si plusieurs nœuds vidéo existent :
 
 ```sh
-python3 follow_me_7.py \
+python3 follow-me-QuickCam-NixOs.py \
   --device /dev/v4l/by-id/VOTRE-PERIPHERIQUE-video-index0 \
   --no-reset --max-delta 200 --preview
 ```
@@ -56,7 +56,7 @@ Le script réinitialise les moteurs au démarrage, sauf si `--no-start-reset` es
 Arrêt : `Ctrl+C`, ou la touche `q` lorsque l’aperçu est ouvert. Pour la liste des options et leurs valeurs par défaut :
 
 ```sh
-python3 follow_me_7.py --help
+python3 follow-me-QuickCam-NixOs.py --help
 ```
 
 ### Réglages courants
@@ -84,7 +84,7 @@ Consultez `--help` : l’ensemble des options varie entre les versions historiqu
 L’installation est prévue pour NixOS avec `nix-shell` et une session graphique utilisateur. Les options supplémentaires fournies à l’installation sont inscrites dans la commande du service ; utilisez donc ici un mode sans zone de notification si vous le souhaitez :
 
 ```sh
-python3 follow_me_7.py --install-service --no-tray --no-reset --max-delta 200
+python3 follow-me-QuickCam-NixOs.py --install-service --no-tray --no-reset --max-delta 200
 systemctl --user status follow-me
 journalctl --user -u follow-me -f
 ```
@@ -94,14 +94,14 @@ La commande installe une copie du script et le shell Nix sous `~/.local/share/fo
 Pour désinstaller l’unité :
 
 ```sh
-python3 follow_me_7.py --uninstall-service
+python3 follow-me-QuickCam-NixOs.py --uninstall-service
 ```
 
 La désinstallation arrête/désactive le service et supprime l’unité systemd, mais conserve les fichiers sous `~/.local/share/follow_me/` et les réglages. Pour gérer les réglages, lancez le script en mode interactif ou modifiez `~/.config/follow_me/settings.json`.
 
 ## Versions historiques fournies
 
-La série décrit l’évolution du script, pas sept implémentations toutes distinctes : les fichiers `follow_me_1.py` et `follow_me_2.py` fournis sont identiques octet pour octet ; le fichier `Logitech-QuickCam-Sphere-NixOs.py` est identique à `follow_me_7.py`.
+La série décrit l’évolution du script, pas sept implémentations toutes distinctes : les fichiers `follow_me_1.py` et `follow_me_2.py` fournis sont identiques octet pour octet ; le fichier `Logitech-QuickCam-Sphere-NixOs.py` est identique à `follow-me-QuickCam-NixOs.py`.
 
 | Version | Évolution visible  |
 |---|---|
@@ -137,7 +137,7 @@ Le projet est destiné à être publié sous la **GNU General Public License, ve
   Exemple pour la caméra Logitech QuickCam Orbit sur NixOS :
 
   ```sh
-  python3 follow_me_7.py --device /dev/v4l/by-id/usb-046d_081d_XXXX-video-index0 --no-reset --max-delta 200 --preview
+  python3 follow-me-QuickCam-NixOs.py --device /dev/v4l/by-id/usb-046d_081d_XXXX-video-index0 --no-reset --max-delta 200 --preview
   ```
 
 - **Résolution des collisions de périphériques :** utilisez les chemins stables `/dev/v4l/by-id/` plutôt que `/dev/videoN`, qui peuvent désigner des périphériques différents selon l’ordre de détection.
