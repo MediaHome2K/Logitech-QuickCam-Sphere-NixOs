@@ -1845,7 +1845,7 @@ def close_previous_instances():
     current_uid = os.getuid()
     username = getpass.getuser()
 
-    def is_Logitech-QuickCam-Sphere-NixOs(pid):
+    def is_logitech_quickcam_sphere_nixos(pid):
         try:
             with open(f"/proc/{pid}/status", encoding="utf-8") as stream:
                 status = stream.read()
@@ -1873,7 +1873,7 @@ def close_previous_instances():
     try:
         pids = (int(entry) for entry in os.listdir("/proc") if entry.isdigit())
         for pid in pids:
-            if pid != current_pid and is_Logitech-QuickCam-Sphere-NixOs(pid):
+            if pid != current_pid and is_logitech_quickcam_sphere_nixos(pid):
                 previous.append(pid)
     except OSError as exc:
         print(f"[AVERTISSEMENT] Lecture de /proc impossible : {exc}", file=sys.stderr)
