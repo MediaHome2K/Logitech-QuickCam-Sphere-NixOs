@@ -1,0 +1,1957 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+r"""
+follow-me-QuickCam-NixOs.py — Suivi de visage avec une caméra PTZ (V4L2).
+
+UTILISATION
+-----------
+
+Sur NixOS, lancer simplement le script : si OpenCV ou v4l2-ctl manque,
+le script écrit le shell.nix intégré dans un fichier temporaire puis se
+relance dans nix-shell (venv + opencv-python via pip). Le marqueur
+Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL empêche une relance infinie.
+
+    python3 follow-me-QuickCam-NixOs.py --no-reset --max-delta 200 --preview
+
+Télécharger le modèle YuNet dans le dossier du script :
+
+    curl -L -o face_detection_yunet_2023mar.onnx \
+      https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx
+
+Si plusieurs caméras PTZ sont détectées :
+
+    ls -l /dev/v4l/by-id/
+    python3 follow-me-QuickCam-NixOs.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 \
+      --no-reset --max-delta 200 --preview
+
+Au lancement, le script réinitialise les moteurs (désactiver avec
+--no-start-reset), puis ignore 12 images pour stabiliser l'exposition.
+--no-reset désactive séparément le recentrage initial logiciel.
+Le zoom automatique est actif par défaut (--no-auto-zoom pour le couper) ;
+la cible est réglable avec --zoom-target-ratio.
+
+Le tilt est inversé par défaut. Utiliser --no-invert-tilt pour désactiver
+l'inversion ou --invert-pan pour inverser le pan.
+
+Diagnostic :
+
+    v4l2-ctl --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 --list-ctrls
+
+Le script ouvre deux fois le même nœud : une fois pour les contrôles PTZ
+et une fois pour la capture vidéo (dépend du pilote V4L2).
+
+Arrêt : Ctrl+C ou touche q lorsque la prévisualisation est active.
+
+# Installer + démarrer immédiatement (redémarre avec chaque session NixOS) :
+python3 follow-me-QuickCam-NixOs.py --install-service
+
+# Avec des options persistantes (elles sont figées dans l'unité) :
+python3 follow-me-QuickCam-NixOs.py --install-service --no-tray --no-reset --max-delta 200
+
+# Vérifier :
+systemctl --user status follow-me
+journalctl --user -u follow-me -f
+
+# Désinstaller :
+python3 follow-me-QuickCam-NixOs.py --uninstall-service
+
+"""
+
+import os
+os.environ.setdefault("PYSTRAY_BACKEND", "appindicator")
+
+import argparse
+import ctypes
+import errno
+import fcntl
+import getpass
+import glob
+import json
+import queue
+import math
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import tempfile
+
+# Dernière image d’aperçu destinée au thread Tkinter.
+PREVIEW_QUEUE = queue.Queue(maxsize=1)
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # géré par ensure_nix_environment()
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+
+# Linux videodev2.h
+VIDIOC_QUERYCTRL = 0xC0445624
+VIDIOC_G_CTRL = 0xC008561B
+VIDIOC_S_CTRL = 0xC008561C
+
+PAN_REL = 0x009A0904
+TILT_REL = 0x009A0905
+PAN_RESET = 0x009A0906
+TILT_RESET = 0x009A0907
+PAN_ABS = 0x009A0908
+TILT_ABS = 0x009A0909
+ZOOM_ABS = 0x009A090D
+
+FLAG_DISABLED = 0x0001
+FLAG_READ_ONLY = 0x0004
+FLAG_INACTIVE = 0x0010
+FLAG_WRITE_ONLY = 0x0040
+
+MODEL_NAME = "face_detection_yunet_2023mar.onnx"
+DEFAULT_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), MODEL_NAME)
+
+DETECT_W = 320
+DETECT_H = 240
+MAX_W = 640
+MAX_H = 480
+
+SHELL_NIX = r"""{ pkgs ? import <nixpkgs> {} }:
+let
+  giPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" [
+    pkgs.gtk3 pkgs.glib pkgs.pango pkgs.gdk-pixbuf pkgs.atk pkgs.harfbuzz
+    pkgs.libayatana-appindicator pkgs.gobject-introspection
+  ];
+in pkgs.mkShell {
+  packages = [
+    (pkgs.python3.withPackages (ps: [
+      (ps.opencv4.override { enableGtk3 = true; })
+      ps.numpy ps.pystray ps.pillow ps.tkinter ps.pygobject3
+    ]))
+    pkgs.tk pkgs.v4l-utils pkgs.gtk3 pkgs.libayatana-appindicator pkgs.gobject-introspection
+  ];
+  LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
+    stdenv.cc.cc.lib zlib libGL glib gtk3 libayatana-appindicator dbus
+    libxkbcommon fontconfig freetype libxcb libx11 libxext libxrender libxi
+    libsm libice wayland
+  ]) + ":/run/opengl-driver/lib";
+  shellHook = ''
+    export GI_TYPELIB_PATH="${giPath}''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+    export QT_QPA_PLATFORM=xcb
+    unset QT_STYLE_OVERRIDE
+  '';
+}
+"""
+
+class V4L2Control(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint32),
+        ("value", ctypes.c_int32),
+    ]
+
+
+class V4L2QueryCtrl(ctypes.Structure):
+    _fields_ = [
+        ("id", ctypes.c_uint32),
+        ("type", ctypes.c_uint32),
+        ("name", ctypes.c_ubyte * 32),
+        ("minimum", ctypes.c_int32),
+        ("maximum", ctypes.c_int32),
+        ("step", ctypes.c_int32),
+        ("default_value", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 2),
+    ]
+
+
+# ----------------------------------------------------------------------
+# Bootstrap NixOS
+# ----------------------------------------------------------------------
+
+def is_nixos():
+    """Détecte NixOS via le marqueur standard ou os-release."""
+    if os.path.exists("/etc/NIXOS"):
+        return True
+    try:
+        with open("/etc/os-release", encoding="utf-8") as f:
+            return any(line.strip().lower() == "id=nixos" for line in f)
+    except OSError:
+        return False
+
+
+def quick_missing(need_tray=False, need_gui=False):
+    """Prérequis Python/système minimaux, sans afficher de chemin local."""
+    missing = []
+    if cv2 is None:
+        missing.append("module Python cv2 (OpenCV)")
+    elif not hasattr(cv2, "FaceDetectorYN"):
+        missing.append("cv2.FaceDetectorYN (OpenCV récent avec YuNet)")
+    if np is None:
+        missing.append("module Python numpy")
+    if need_tray:
+        try:
+            import pystray  # noqa: F401
+        except Exception as exc:
+            missing.append(f"module Python pystray : {exc}")
+        try:
+            from PIL import Image, ImageDraw  # noqa: F401
+        except ImportError:
+            missing.append("module Python Pillow (PIL)")
+        try:
+            import tkinter  # noqa: F401
+        except ImportError:
+            missing.append("module Python tkinter")
+    if shutil.which("v4l2-ctl") is None:
+        missing.append("v4l2-ctl (v4l-utils)")
+    if need_gui and cv2 is not None:
+        info = cv2.getBuildInformation()
+        if not any(line.strip().startswith(("GTK+:", "GTK:", "QT:")) and "YES" in line
+                   for line in info.splitlines()):
+            missing.append("OpenCV compilé avec un backend graphique (GTK/Qt)")
+    return missing
+
+
+def ensure_nix_environment(need_tray=False, need_gui=False):
+    """Sur NixOS, relance dans le shell Nix intégré si un prérequis manque."""
+    missing = quick_missing(need_tray, need_gui)
+    if not missing or os.environ.get("Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL"):
+        return
+    if not (is_nixos() and shutil.which("nix-shell")):
+        return
+    print("Prérequis manquants : " + ", ".join(missing) + ".", file=sys.stderr)
+    fd, shell_file = tempfile.mkstemp(prefix="follow-me-", suffix=".nix")
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(SHELL_NIX)
+    print("NixOS détecté : lancement du shell de dépendances intégré…", file=sys.stderr)
+    script = os.path.abspath(__file__)
+    cmd = "python " + " ".join(shlex.quote(arg) for arg in [script, *sys.argv[1:]])
+    env = {**os.environ, "Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL": "1"}
+    os.execvpe("nix-shell", ["nix-shell", shell_file, "--run", cmd], env)
+
+
+def tray_environment_status():
+    """Vérifie la session DBus et le watcher StatusNotifier de Plasma."""
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return False, "aucune session DBus détectée"
+    if "kde" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower() and        "plasma" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
+        return False, "session Plasma/KDE non détectée"
+    probe = shutil.which("busctl")
+    if probe:
+        try:
+            result = subprocess.run([probe, "--user", "status", "org.kde.StatusNotifierWatcher"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=2)
+            if result.returncode == 0:
+                return True, "session DBus et StatusNotifier disponibles"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # busctl status peut échouer selon les versions DBus : au minimum, confirmer
+    # que la session bus répond; le backend pystray déterminera le reste.
+    dbus_send = shutil.which("dbus-send")
+    if dbus_send:
+        try:
+            result = subprocess.run([dbus_send, "--session", "--dest=org.freedesktop.DBus",
+                                     "/org/freedesktop/DBus", "org.freedesktop.DBus.ListNames"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, timeout=2)
+            if result.returncode == 0 and "org.kde.StatusNotifierWatcher" in result.stdout:
+                return True, "session DBus et StatusNotifier disponibles"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return False, "service StatusNotifier/DBus indisponible dans cette session"
+
+
+
+# ----------------------------------------------------------------------
+# Vérification détaillée des prérequis
+# ----------------------------------------------------------------------
+
+def check_prerequisites(args):
+    """Vérifie les prérequis et affiche un rapport. Lève RuntimeError si bloquant."""
+    errors = []
+    warnings = []
+
+    def ok(msg):
+        print(f"  [OK]   {msg}")
+
+    def warn(msg):
+        print(f"  [WARN] {msg}")
+        warnings.append(msg)
+
+    def fail(msg):
+        print(f"  [ERREUR] {msg}")
+        errors.append(msg)
+
+    print("Vérification des prérequis :")
+
+    # OpenCV et module de détection de visages
+    ok(f"OpenCV {cv2.__version__}")
+    if hasattr(cv2, "FaceDetectorYN"):
+        ok("cv2.FaceDetectorYN disponible")
+    else:
+        fail("cv2.FaceDetectorYN absent : OpenCV >= 4.5.4 requis")
+
+    # Modèle YuNet
+    model = os.path.expanduser(args.model)
+    if os.path.isfile(model):
+        if os.path.getsize(model) < 100_000:
+            fail(f"Modèle suspect (trop petit) : {model} ; retélécharge-le")
+        else:
+            ok(f"Modèle YuNet : {model}")
+    else:
+        fail(
+            f"Modèle introuvable : {model}\n"
+            "         curl -L -o face_detection_yunet_2023mar.onnx "
+            "https://huggingface.co/opencv/face_detection_yunet/resolve/main/"
+            "face_detection_yunet_2023mar.onnx"
+        )
+
+    # Backend V4L2 d'OpenCV
+    try:
+        build = cv2.getBuildInformation()
+    except cv2.error:
+        build = ""
+
+    def build_flag(name):
+        for line in build.splitlines():
+            if line.strip().startswith(name + ":"):
+                return "YES" in line
+        return None
+
+    v4l = build_flag("V4L/V4L2")
+    if v4l is False:
+        fail("OpenCV compilé sans support V4L2")
+    elif v4l:
+        ok("Support V4L2 dans OpenCV")
+
+    # Périphérique caméra
+    if args.device:
+        dev = os.path.expanduser(args.device)
+        if not os.path.exists(dev):
+            fail(f"Périphérique introuvable : {dev}")
+        elif not os.access(dev, os.R_OK | os.W_OK):
+            fail(
+                f"Droits insuffisants sur {dev} "
+                "(ajoute ton utilisateur au groupe 'video')"
+            )
+        else:
+            ok(f"Périphérique accessible : {dev}")
+    else:
+        paths = glob.glob("/dev/v4l/by-id/*-video-index*")
+        if not paths:
+            fail("Aucun nœud /dev/v4l/by-id/*-video-index* (caméra branchée ?)")
+        else:
+            denied = [p for p in paths if not os.access(p, os.R_OK | os.W_OK)]
+            if denied:
+                fail(
+                    "Droits insuffisants sur : " + ", ".join(denied)
+                    + " (groupe 'video' ?)"
+                )
+            else:
+                ok(f"{len(paths)} nœud(s) vidéo accessible(s)")
+
+    # v4l2-ctl (diagnostic seulement)
+    if shutil.which("v4l2-ctl"):
+        ok("v4l2-ctl disponible")
+    elif args.no_start_reset:
+        warn("v4l2-ctl absent ; les resets matériels et commandes zoom sont indisponibles.")
+    else:
+        fail(
+            "v4l2-ctl absent : installe v4l-utils ; requis pour le reset "
+            "matériel de démarrage (ou utilise --no-start-reset)"
+        )
+
+    # Le diagnostic de lancement détaillé est émis par ZoomController après
+    # sélection du véritable nœud PTZ; aucun échec de détection n'est silencieux.
+    if args.no_auto_zoom:
+        ok("Zoom automatique désactivé par option")
+    elif not shutil.which("v4l2-ctl"):
+        warn("Zoom auto désactivé : v4l2-ctl absent.")
+
+    # Prévisualisation
+    if args.preview:
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            fail("--preview demandé mais aucun environnement graphique "
+                 "(DISPLAY / WAYLAND_DISPLAY vides)")
+        else:
+            gui = None
+            for line in build.splitlines():
+                if line.strip().startswith(("GTK+:", "GTK:", "QT:", "Win32 UI:",
+                                            "Cocoa:")):
+                    if "YES" in line:
+                        gui = line.strip()
+                        break
+            if gui is None:
+                fail(
+                    "OpenCV sans backend graphique (GTK/Qt) : "
+                    "utilise opencv4.override { enableGtk3 = true; } "
+                    "ou lance sans --preview"
+                )
+            else:
+                ok(f"Backend graphique : {gui}")
+
+    if warnings:
+        print(f"  {len(warnings)} avertissement(s).")
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} prérequis manquant(s) ; corrige-les puis relance."
+        )
+    print("Tous les prérequis bloquants sont satisfaits.\n")
+
+
+# ----------------------------------------------------------------------
+# Utilitaires et contrôle PTZ
+# ----------------------------------------------------------------------
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def snap(value, control):
+    """Arrondit sur la grille minimum + n * step."""
+    minimum, maximum, step = control
+    value = clamp(value, minimum, maximum)
+    value = minimum + round((value - minimum) / step) * step
+    return int(clamp(value, minimum, maximum))
+
+
+class PTZCamera:
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+        self.last_motor_ts = 0.0
+
+        try:
+            self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            self._detect_caps()
+        except Exception:
+            self.close()
+            raise
+
+    def query(self, cid, require_read=False):
+        q = V4L2QueryCtrl()
+        q.id = cid
+
+        try:
+            fcntl.ioctl(self.fd, VIDIOC_QUERYCTRL, q)
+        except OSError as exc:
+            if exc.errno in (errno.EINVAL, errno.ENOTTY):
+                return None
+            raise
+
+        forbidden = FLAG_DISABLED | FLAG_READ_ONLY | FLAG_INACTIVE
+        if q.flags & forbidden:
+            return None
+        if require_read and q.flags & FLAG_WRITE_ONLY:
+            return None
+
+        return q.minimum, q.maximum, max(1, q.step)
+
+    def get(self, cid):
+        ctrl = V4L2Control(cid, 0)
+        fcntl.ioctl(self.fd, VIDIOC_G_CTRL, ctrl)
+        return ctrl.value
+
+    def set(self, cid, value):
+        ctrl = V4L2Control(cid, int(value))
+        fcntl.ioctl(self.fd, VIDIOC_S_CTRL, ctrl)
+
+    def _detect_caps(self):
+        pan = self.query(PAN_ABS, require_read=True)
+        tilt = self.query(TILT_ABS, require_read=True)
+
+        if pan is not None and tilt is not None:
+            try:
+                pan_value = self.get(PAN_ABS)
+                tilt_value = self.get(TILT_ABS)
+            except OSError:
+                # Certains pilotes exposent des contrôles non lisibles.
+                pass
+            else:
+                self.absolute = True
+                self.mode = "absolu"
+                self.pan_range = pan
+                self.tilt_range = tilt
+                self.pan_target = float(pan_value)
+                self.tilt_target = float(tilt_value)
+                self.pan_sent = pan_value
+                self.tilt_sent = tilt_value
+                return
+
+        pan = self.query(PAN_REL)
+        tilt = self.query(TILT_REL)
+
+        if pan is None or tilt is None:
+            raise RuntimeError(
+                f"{self.path} : contrôles pan/tilt absolus lisibles "
+                "ou relatifs indisponibles."
+            )
+
+        self.absolute = False
+        self.mode = "relatif"
+        self.pan_range = pan
+        self.tilt_range = tilt
+        self.pan_pending = 0.0
+        self.tilt_pending = 0.0
+
+    def refresh_absolute(self):
+        if self.absolute:
+            self.pan_sent = self.get(PAN_ABS)
+            self.tilt_sent = self.get(TILT_ABS)
+            self.pan_target = float(self.pan_sent)
+            self.tilt_target = float(self.tilt_sent)
+
+    def center(self):
+        """
+        Recentrage absolu au milieu de chaque plage.
+        En mode relatif, utilise les boutons reset s'ils sont disponibles.
+        Renvoie False si le recentrage relatif n'est pas disponible.
+        """
+        if self.absolute:
+            pmin, pmax, _ = self.pan_range
+            tmin, tmax, _ = self.tilt_range
+
+            pan = snap((pmin + pmax) / 2, self.pan_range)
+            tilt = snap((tmin + tmax) / 2, self.tilt_range)
+
+            self.set(PAN_ABS, pan)
+            self.set(TILT_ABS, tilt)
+            self.pan_sent = pan
+            self.tilt_sent = tilt
+            self.pan_target = float(pan)
+            self.tilt_target = float(tilt)
+        else:
+            if self.query(PAN_RESET) is None or self.query(TILT_RESET) is None:
+                return False
+
+            self.set(PAN_RESET, 1)
+            self.set(TILT_RESET, 1)
+            self.pan_pending = 0.0
+            self.tilt_pending = 0.0
+
+        self.last_motor_ts = time.monotonic()
+        return True
+
+    def move(
+        self, pan_delta, tilt_delta, min_interval, max_delta,
+        invert_pan=False, invert_tilt=True,
+    ):
+        """Applique la correction avec inversion au moment de la commande."""
+        pan_delta = -pan_delta if invert_pan else pan_delta
+        tilt_delta = -tilt_delta if invert_tilt else tilt_delta
+        now = time.monotonic()
+        if now - self.last_motor_ts < min_interval:
+            return False
+
+        pan_delta = clamp(pan_delta, -max_delta, max_delta)
+        tilt_delta = clamp(tilt_delta, -max_delta, max_delta)
+
+        if self.absolute:
+            pmin, pmax, _ = self.pan_range
+            tmin, tmax, _ = self.tilt_range
+
+            # Conserver les fractions permet d'atteindre le pas matériel
+            # même lorsque chaque correction est petite.
+            self.pan_target = clamp(
+                self.pan_target + pan_delta, pmin, pmax
+            )
+            self.tilt_target = clamp(
+                self.tilt_target + tilt_delta, tmin, tmax
+            )
+
+            pan = snap(self.pan_target, self.pan_range)
+            tilt = snap(self.tilt_target, self.tilt_range)
+            changed = False
+
+            if pan != self.pan_sent:
+                self.set(PAN_ABS, pan)
+                self.pan_sent = pan
+                changed = True
+
+            if tilt != self.tilt_sent:
+                self.set(TILT_ABS, tilt)
+                self.tilt_sent = tilt
+                changed = True
+        else:
+            # Accumulation bornée : pas de longue file de mouvements
+            # en cas de petites corrections répétées.
+            self.pan_pending = clamp(
+                self.pan_pending + pan_delta, -max_delta, max_delta
+            )
+            self.tilt_pending = clamp(
+                self.tilt_pending + tilt_delta, -max_delta, max_delta
+            )
+
+            pan = snap(self.pan_pending, self.pan_range)
+            tilt = snap(self.tilt_pending, self.tilt_range)
+            changed = False
+
+            if pan:
+                self.set(PAN_REL, pan)
+                self.pan_pending -= pan
+                changed = True
+
+            if tilt:
+                self.set(TILT_REL, tilt)
+                self.tilt_pending -= tilt
+                changed = True
+
+        if changed:
+            self.last_motor_ts = now
+        return changed
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def select_camera(device):
+    if device:
+        return PTZCamera(device)
+
+    paths = sorted(glob.glob("/dev/v4l/by-id/*-video-index*"))
+    preferred = "/dev/v4l/by-id/usb-046d_08b5-video-index0"
+    if preferred in paths:
+        paths.remove(preferred)
+        paths.insert(0, preferred)
+    candidates = []
+    errors = []
+    seen = set()
+
+    for path in paths:
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+
+        try:
+            candidates.append(PTZCamera(path))
+        except (OSError, RuntimeError) as exc:
+            errors.append(f"  {path} : {exc}")
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    for camera in candidates:
+        camera.close()
+
+    if len(candidates) > 1:
+        choices = "\n".join(f"  {camera.path}" for camera in candidates)
+        raise RuntimeError(
+            "Plusieurs nœuds PTZ détectés ; choisis-en un avec --device :\n"
+            + choices
+        )
+
+    detail = "\n".join(errors) if errors else "  Aucun nœud by-id trouvé."
+    raise RuntimeError(
+        "Aucune caméra PTZ utilisable détectée.\n"
+        f"{detail}\n"
+        "Vérifie les droits et les contrôles avec v4l2-ctl, "
+        "ou indique le nœud avec --device."
+    )
+
+
+def query_zoom_control(device):
+    """Trouve un contrôle zoom V4L2 exploitable et lit ses bornes/flags."""
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--list-ctrls"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", None)
+        return None, (detail.strip() if detail else str(exc))
+
+    # Préférence aux commandes absolues; les contrôles relatifs sont utilisés
+    # uniquement en dernier recours, puisqu'ils expriment un déplacement.
+    controls = {}
+    for line in result.stdout.splitlines():
+        # v4l2-ctl versions may include a hexadecimal control ID between
+        # the name and type: zoom_absolute 0x009a090d (int) : ...
+        match = re.match(
+            r"^\s*(zoom_absolute|zoom_continuous|zoom_relative)"
+            r"(?:\s+0x[0-9a-fA-F]+)?\s+\(([^)]*)\)\s*:", line
+        )
+        if not match:
+            continue
+        name, kind = match.groups()
+        values = {key: int(value) for key, value in
+                  re.findall(r"(min|max|step|default|value)=(-?\d+)", line)}
+        flags_match = re.search(r"\bflags=([^ ]+)", line)
+        flags = flags_match.group(1).strip("[]") if flags_match else ""
+        controls[name] = (kind, values, flags, line.strip())
+
+    for name in ("zoom_absolute", "zoom_continuous", "zoom_relative"):
+        if name not in controls:
+            continue
+        kind, values, flags, line = controls[name]
+        if "disabled" in flags or "inactive" in flags:
+            continue
+        if not all(key in values for key in ("min", "max", "step")):
+            continue
+        return {
+            "name": name, "kind": kind,
+            "minimum": values["min"], "maximum": values["max"],
+            "step": max(1, abs(values["step"])),
+            "default": values.get("default", values["min"]),
+            "relative": name != "zoom_absolute",
+        }, None
+
+    if controls:
+        details = "; ".join(f"{name}: {info[2] or 'bornes indisponibles'}"
+                             for name, info in controls.items())
+        return None, "contrôle zoom présent mais inutilisable (inactif/désactivé ou sans bornes): " + details
+    return None, "aucun zoom_absolute, zoom_continuous ou zoom_relative dans --list-ctrls"
+
+
+class ZoomController:
+    """Zoom V4L2 borné, temporisé et piloté par le ratio de taille du visage."""
+
+    def __init__(self, device, enabled=True, target_ratio=0.25,
+                 max_step=None, max_zoom=3.0, min_interval=0.12, smoothing=0.55):
+        self.device = device
+        self.info, error = query_zoom_control(device)
+        self.enabled = bool(enabled and self.info is not None)
+        self.target_ratio = target_ratio
+        self.min_interval = min_interval
+        self.smoothing = smoothing
+        self.filtered_ratio = None
+        self.last_command_at = 0.0
+        self.current = None
+        self.digital = bool(enabled and self.info is None)
+        self.max_zoom = float(max_zoom)
+        self.control = self.info["name"] if self.info else None
+        if self.info is None:
+            self.current = 1.0
+            self.digital = True
+            self.enabled = bool(enabled)
+            print("Zoom auto : zoom numérique (aucun contrôle V4L2 zoom).")
+        else:
+            bounds = f"{self.info['minimum']}..{self.info['maximum']}"
+            print(f"Zoom auto : zoom matériel trouvé — contrôle {self.control}, plage {bounds}, pas {self.info['step']}.")
+        if not enabled:
+            print("Zoom auto : désactivé par --no-auto-zoom.")
+        if self.info is not None:
+            self.minimum = self.info["minimum"]
+            self.maximum = self.info["maximum"]
+            self.control_step = self.info["step"]
+            self.max_step = max_step if max_step is not None else 8 * self.control_step
+            self.max_step = max(self.control_step,
+                                int(round(self.max_step / self.control_step)) * self.control_step)
+            if self.info["relative"]:
+                # Relative/continuous controls are pulses; they have no
+                # meaningful persistent position to read back.
+                if not (self.minimum < 0 < self.maximum):
+                    print(f"Zoom auto désactivé : {self.control} ne fournit pas "
+                          "de plage bidirectionnelle exploitable.", file=sys.stderr)
+                    self.enabled = False
+                    self.current = None
+                elif enabled:
+                    self.current = 0
+            elif enabled:
+                self._read_current()
+
+    def _read_current(self):
+        try:
+            readback = subprocess.run(
+                ["v4l2-ctl", "-d", self.device, f"--get-ctrl={self.control}"],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=5,
+            )
+            match = re.search(rf"{re.escape(self.control)}\s*:\s*(-?\d+)", readback.stdout)
+            if not match:
+                raise RuntimeError(f"valeur {self.control} absente de la réponse")
+            self.current = int(match.group(1))
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            detail = getattr(exc, "stderr", None)
+            print(f"[AVERTISSEMENT] Lecture de {self.control} impossible : "
+                  f"{detail.strip() if detail else exc}; zoom auto désactivé.", file=sys.stderr)
+            self.enabled = False
+
+    def _set_value(self, value, ratio=None):
+        """Envoie une commande et expose toute erreur renvoyée par v4l2-ctl."""
+        relative = self.info["relative"]
+        if relative:
+            # A signed command is interpreted as direction by these controls;
+            # cap the pulse to the advertised legal range.
+            value = max(self.minimum, min(self.maximum, int(value)))
+            if value == 0:
+                return False
+        else:
+            highest_valid = self.minimum + ((self.maximum - self.minimum) // self.control_step) * self.control_step
+            value = clamp(snap(value, (self.minimum, self.maximum, self.control_step)),
+                          self.minimum, highest_valid)
+            if value == self.current:
+                return False
+        command = ["v4l2-ctl", "-d", self.device, f"--set-ctrl={self.control}={value}"]
+        try:
+            result = subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = getattr(exc, "stderr", None) or getattr(exc, "stdout", None)
+            print(f"[AVERTISSEMENT] Commande {' '.join(command)} échouée : "
+                  f"{detail.strip() if detail else exc}", file=sys.stderr)
+            self.enabled = False
+            return False
+        if not relative:
+            self.current = value
+        self.last_command_at = time.monotonic()
+        ratio_text = f" ratio={ratio:.3f}" if ratio is not None else ""
+        print(f"Zoom envoyé : contrôle={self.control}{ratio_text} "
+              f"cible={self.target_ratio:.3f} valeur={value}" +
+              (" (relatif)" if relative else ""))
+        return True
+
+    def reset(self):
+        """Remet le zoom absolu à sa valeur par défaut; pas d'impulsion relative."""
+        if self.info is None or self.current is None or self.info["relative"]:
+            return False
+        return self._set_value(self.info.get("default", self.minimum))
+
+    def update(self, face_ratio):
+        """Ajuste le zoom au ratio largeur visage/image, y compris visage centré."""
+        if not self.enabled or self.current is None:
+            return False
+        if self.filtered_ratio is None:
+            self.filtered_ratio = face_ratio
+        else:
+            a = self.smoothing
+            self.filtered_ratio = a * face_ratio + (1 - a) * self.filtered_ratio
+        low = self.target_ratio * 0.9
+        high = self.target_ratio * 1.1
+        if low <= self.filtered_ratio <= high:
+            return False
+        now = time.monotonic()
+        if now - self.last_command_at < self.min_interval:
+            return False
+        direction = 1 if self.filtered_ratio < low else -1
+        ratio = self.filtered_ratio
+        if self.digital:
+            # Face ratio is measured in the already digitally zoomed frame.
+            # Scale the current zoom by the ratio error to estimate the target.
+            target = clamp(self.current * self.target_ratio / max(ratio, 1e-6),
+                           1.0, self.max_zoom)
+            delta = self.smoothing * (target - self.current)
+            # A bounded per-command change avoids abrupt crop jumps even for
+            # a newly detected, very small/large face.
+            delta = clamp(delta, -0.08, 0.08)
+            if abs(delta) < 0.001:
+                return False
+            self.current = clamp(self.current + delta, 1.0, self.max_zoom)
+            self.last_command_at = now
+            print(f"Zoom numérique : ratio={ratio:.3f} facteur={self.current:.3f}")
+            return True
+        if self.info["relative"]:
+            value = self.maximum if direction > 0 else self.minimum
+        else:
+            value = clamp(self.current + direction * self.max_step,
+                          self.minimum, self.maximum)
+        return self._set_value(value, ratio=ratio)
+
+
+    def update_lost(self, lost_seconds):
+        """Après une longue perte, dézoome doucement pour faciliter la reprise."""
+        if not self.enabled or not self.digital or self.current <= 1.0:
+            return False
+        now = time.monotonic()
+        if lost_seconds <= 5.0 or now - self.last_command_at < self.min_interval:
+            return False
+        self.current = max(1.0, self.current - 0.02)
+        self.last_command_at = now
+        return True
+
+
+def crop_center_zoom(frame, factor):
+    """Centre-crop par factor puis redimensionne à la taille initiale."""
+    factor = max(1.0, float(factor))
+    if factor <= 1.0:
+        return frame.copy()
+    height, width = frame.shape[:2]
+    crop_w = max(1, int(round(width / factor)))
+    crop_h = max(1, int(round(height / factor)))
+    x0 = (width - crop_w) // 2
+    y0 = (height - crop_h) // 2
+    cropped = frame[y0:y0 + crop_h, x0:x0 + crop_w]
+    return cv2.resize(cropped, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def reset_camera(device, wait=3.0):
+    """Réinitialise les axes de la caméra avant l'ouverture de la capture.
+
+    La commande v4l2-ctl vise les contrôles usuels Logitech PTZ. Une erreur
+    n'empêche pas de poursuivre : certains pilotes ne les exposent pas.
+    """
+    command = [
+        "v4l2-ctl", "-d", device,
+        "--set-ctrl=pan_reset=1,tilt_reset=1",
+    ]
+    try:
+        subprocess.run(
+            command, check=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, "stderr", None)
+        detail = detail.strip() if detail else str(exc)
+        print(
+            f"[AVERTISSEMENT] Reset initial non exécuté par v4l2-ctl : {detail}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"Reset pan/tilt envoyé ; stabilisation {wait:g} s…")
+    time.sleep(max(0.0, wait))
+    return True
+
+
+# ----------------------------------------------------------------------
+# Capture vidéo
+# ----------------------------------------------------------------------
+
+class FreshCamera:
+    """
+    Le thread possède VideoCapture et le libère lui-même.
+    La dernière image seulement est conservée.
+    """
+
+    def __init__(self, path, width, height, fps):
+        self.path = path
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.frame = None
+        self.seq = 0
+        self.error = None
+
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(self.path, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                raise RuntimeError(f"Impossible d'ouvrir {self.path} en capture.")
+
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            cap.set(cv2.CAP_PROP_FPS, self.fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            while not self.stop.is_set():
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    self.stop.wait(0.02)
+                    continue
+
+                with self.lock:
+                    self.frame = frame
+                    self.seq += 1
+
+        except Exception as exc:
+            with self.lock:
+                self.error = exc
+        finally:
+            if cap is not None:
+                cap.release()
+
+    def latest(self, last_seq):
+        with self.lock:
+            if self.error is not None:
+                raise RuntimeError(f"Erreur de capture : {self.error}")
+            if self.frame is None or self.seq == last_seq:
+                return None, last_seq
+            return self.frame.copy(), self.seq
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=2.0)
+        if self.thread.is_alive():
+            print(
+                "Attention : le pilote bloque encore une lecture caméra ; "
+                "le thread de capture n'a pas terminé.",
+                file=sys.stderr,
+            )
+
+
+# ----------------------------------------------------------------------
+# Suivi
+# ----------------------------------------------------------------------
+
+def axis_step(error, deadzone, gain):
+    if abs(error) <= deadzone:
+        return 0.0
+    effective = error - math.copysign(deadzone, error)
+    return gain * effective
+
+
+def show_preview(frame, face, smooth):
+    display = frame.copy()
+    height, width = frame.shape[:2]
+    sx = width / DETECT_W
+    sy = height / DETECT_H
+
+    if face is not None:
+        x, y, w, h = face[:4]
+        cv2.rectangle(
+            display,
+            (int(x * sx), int(y * sy)),
+            (int((x + w) * sx), int((y + h) * sy)),
+            (0, 255, 0),
+            2,
+        )
+
+    if smooth is not None:
+        x = int(width / 2 + smooth[0] * sx)
+        y = int(height / 2 + smooth[1] * sy)
+        cv2.drawMarker(display, (x, y), (0, 0, 255),
+                       cv2.MARKER_CROSS, 20, 2)
+
+    try:
+        PREVIEW_QUEUE.put_nowait(display.copy())
+    except queue.Full:
+        try:
+            PREVIEW_QUEUE.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            PREVIEW_QUEUE.put_nowait(display.copy())
+        except queue.Full:
+            pass
+    return True
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Suivi de visage PTZ V4L2")
+    p.add_argument("-d", "--device", help="nœud V4L2 à utiliser")
+    p.add_argument("--model", default=DEFAULT_MODEL, help="chemin du modèle ONNX")
+    p.add_argument("--width", type=int, default=640)
+    p.add_argument("--height", type=int, default=480)
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--detect-every", type=int, default=2)
+    p.add_argument("--score", type=float, default=0.5)
+    p.add_argument("--smooth", type=float, default=0.6)
+    p.add_argument("--deadzone", type=float, nargs=2, default=(16, 12),
+                   metavar=("X", "Y"))
+    p.add_argument("--kp-pan", type=float, default=6.0)
+    p.add_argument("--kp-tilt", type=float, default=4.5)
+    p.add_argument("--invert-pan", action="store_true", default=False,
+                   help="inverser le sens du pan (désactivé par défaut)")
+    p.add_argument("--invert-tilt", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="inverser le tilt par défaut ; --no-invert-tilt pour désactiver")
+    p.add_argument("--no-start-reset", action="store_true",
+                   help="ne pas envoyer pan_reset/tilt_reset au lancement")
+    p.add_argument("--motor-interval", type=float, default=0.06)
+    p.add_argument("--max-delta", type=float, default=1000.0,
+                   help="correction maximale par axe et commande")
+    p.add_argument("--lost-recenter", type=float, default=3.0,
+                   help="secondes avant recentrage ; 0 désactive")
+    p.add_argument("--frame-timeout", type=float, default=5.0)
+    p.add_argument("--no-auto-zoom", action="store_true",
+                   help="désactiver le zoom automatique (actif par défaut)")
+    p.add_argument("--zoom-target-ratio", type=float, default=0.25,
+                   help="largeur de visage cible / largeur image (défaut : 0.25)")
+    p.add_argument("--zoom-max", type=float, default=3.0,
+                   help="facteur maximal du zoom numérique (défaut : 3.0)")
+    p.add_argument("--zoom-step", type=float, default=None,
+                   help="pas maximal par commande ; défaut : 3 pas du contrôle caméra")
+    p.add_argument("--preview", action="store_true")
+    p.add_argument("--no-tray", action="store_true",
+                   help="mode terminal sans icône ni panneau de réglages")
+    p.add_argument("--no-reset", action="store_true",
+                   help="ne pas recentrer après la première image ; le reset de démarrage reste actif")
+    p.add_argument("--install-service", action="store_true",
+                   help="installer le script comme service utilisateur systemd "
+                        "(démarrage automatique avec la session NixOS) puis le démarrer")
+    p.add_argument("--uninstall-service", action="store_true",
+                   help="arrêter et supprimer le service systemd utilisateur")
+    args = p.parse_args()
+
+    floats = [
+        args.score, args.smooth, *args.deadzone,
+        args.kp_pan, args.kp_tilt, args.motor_interval,
+        args.max_delta, args.lost_recenter, args.frame_timeout,
+        args.zoom_target_ratio, args.zoom_max,
+    ]
+    if args.zoom_step is not None:
+        floats.append(args.zoom_step)
+    if not all(math.isfinite(value) for value in floats):
+        p.error("les paramètres numériques doivent être finis")
+    if not (1 <= args.width <= MAX_W and 1 <= args.height <= MAX_H):
+        p.error("la résolution demandée doit être comprise entre 1x1 et 640x480")
+    if args.fps < 1 or args.detect_every < 1:
+        p.error("--fps et --detect-every doivent être >= 1")
+    if not (0 < args.score <= 1 and 0 < args.smooth <= 1):
+        p.error("--score et --smooth doivent être compris entre 0 exclu et 1")
+    if min(args.deadzone) < 0 or args.kp_pan < 0 or args.kp_tilt < 0:
+        p.error("zones mortes et gains doivent être positifs ou nuls")
+    if args.motor_interval < 0 or args.lost_recenter < 0:
+        p.error("les intervalles doivent être positifs ou nuls")
+    if args.max_delta <= 0 or args.frame_timeout <= 0:
+        p.error("--max-delta et --frame-timeout doivent être > 0")
+    if not 0 < args.zoom_target_ratio < 1:
+        p.error("--zoom-target-ratio doit être compris entre 0 et 1")
+    if args.zoom_max < 1:
+        p.error("--zoom-max doit être >= 1")
+    if args.zoom_step is not None and args.zoom_step <= 0:
+        p.error("--zoom-step doit être > 0")
+
+    return args
+
+
+def run_tracking(args, live_settings=None, stop=None):
+    """Exécute sans modification la boucle PTZ historique, dans son thread."""
+    global cv2
+    if cv2 is None:
+        try:
+            import cv2 as _cv2
+        except ImportError as exc:
+            raise RuntimeError("OpenCV est absent ; vérifiez les dépendances.") from exc
+        cv2 = _cv2
+    if live_settings is not None:
+        with live_settings["lock"]:
+            initial = dict(live_settings["values"])
+        args.zoom_max = initial["zoom_max"]
+        args.zoom_target_ratio = initial["face_target"]
+        args.deadzone = (initial["deadzone_x"], initial["deadzone_y"])
+        args.kp_pan = 6.0 * initial["speed"]
+        args.kp_tilt = 4.5 * initial["speed"]
+        args.invert_tilt = initial["invert_y"]
+        args.preview = initial["preview"]
+        args.no_auto_zoom = not initial["zoom_enabled"]
+    check_prerequisites(args)
+    model = os.path.expanduser(args.model)
+
+    if not os.path.isfile(model):
+        raise RuntimeError(f"Modèle YuNet introuvable : {model}")
+
+    detector = cv2.FaceDetectorYN.create(
+        model, "", (DETECT_W, DETECT_H), args.score, 0.6, 20
+    )
+
+    stop = stop if stop is not None else threading.Event()
+
+    ptz = None
+    cam = None
+
+    try:
+        ptz = select_camera(args.device)
+        print(
+            f"Caméra : {ptz.path} ; mode {ptz.mode} ; "
+            f"pan {ptz.pan_range} ; tilt {ptz.tilt_range}"
+        )
+        zoom = ZoomController(
+            ptz.path, enabled=not args.no_auto_zoom,
+            target_ratio=args.zoom_target_ratio, max_step=args.zoom_step,
+            max_zoom=args.zoom_max,
+        )
+        if zoom.info is not None and zoom.enabled:
+            print(f"Cible zoom : ratio visage/image {args.zoom_target_ratio:.3f}; "
+                  f"délai minimal {zoom.min_interval:.2f}s.")
+
+        # Reset moteur distinct du recentrage logiciel --no-reset.
+        if not args.no_start_reset:
+            reset_camera(ptz.path)
+        else:
+            print("Reset matériel de démarrage désactivé (--no-start-reset).")
+        if zoom.info is not None:
+            if zoom.reset():
+                print(f"Reset zoom démarrage : {zoom.current}.")
+            else:
+                print("Zoom déjà à sa valeur de reset.")
+
+        cam = FreshCamera(ptz.path, args.width, args.height, args.fps)
+
+        last_seq = -1
+        last_frame_at = time.monotonic()
+        first_frame = True
+        frame_index = 0
+        warmup_frames_remaining = 12
+        startup_search = True
+        startup_search_started = time.monotonic()
+        search_step_index = 0
+        next_search_at = startup_search_started
+        last_face = None
+        lost_since = None
+        recentered_for_loss = False
+        smooth_x = 0.0
+        smooth_y = 0.0
+        has_smooth = False
+
+        print("Suivi actif : Ctrl+C ou q pour quitter.")
+
+        while not stop.is_set():
+            if live_settings is not None:
+                with live_settings["lock"]:
+                    current = dict(live_settings["values"])
+                args.zoom_max = current["zoom_max"]
+                args.zoom_target_ratio = current["face_target"]
+                args.deadzone = (current["deadzone_x"], current["deadzone_y"])
+                args.kp_pan = 6.0 * current["speed"]
+                args.kp_tilt = 4.5 * current["speed"]
+                args.invert_tilt = current["invert_y"]
+                args.preview = current["preview"]
+                if "zoom" in locals():
+                    zoom.max_zoom = current["zoom_max"]
+                    zoom.target_ratio = current["face_target"]
+                    was_enabled = zoom.enabled
+                    zoom.enabled = bool(current["zoom_enabled"] and
+                                        (zoom.info is not None or zoom.digital))
+                    if zoom.enabled and not was_enabled and zoom.current is None:
+                        if zoom.info is not None and zoom.info["relative"]:
+                            zoom.current = 0
+                        elif zoom.info is not None:
+                            zoom._read_current()
+                    if zoom.digital and zoom.current is not None:
+                        zoom.current = clamp(zoom.current, 1.0, zoom.max_zoom)
+            # Capture the just-refreshed inversion value for this iteration;
+            # both PTZ movement paths use this, never the startup setting.
+            current_invert_tilt = args.invert_tilt
+            frame, seq = cam.latest(last_seq)
+
+            if frame is None:
+                if time.monotonic() - last_frame_at > args.frame_timeout:
+                    raise RuntimeError(
+                        "Aucune nouvelle image : caméra bloquée, débranchée "
+                        "ou occupée."
+                    )
+                stop.wait(0.003)
+                continue
+
+            last_seq = seq
+            last_frame_at = time.monotonic()
+            frame_index += 1
+
+            height, width = frame.shape[:2]
+            if width > MAX_W or height > MAX_H:
+                raise RuntimeError(
+                    f"Résolution réelle {width}x{height} supérieure à "
+                    "640x480 : arrêt avant commande PTZ."
+                )
+
+            if first_frame:
+                first_frame = False
+                print(f"Capture réelle : {width}x{height}")
+
+                if not args.no_reset:
+                    if ptz.center():
+                        print("Recentrage initial…")
+                        if stop.wait(1.5):
+                            break
+                        ptz.refresh_absolute()
+                    else:
+                        print("Recentrage initial indisponible sur ce pilote.")
+
+            # Les images capturées juste après l'ouverture ont souvent une
+            # exposition/ balance des blancs transitoire. Les ignorer évite
+            # une commande basée sur une détection initiale instable.
+            if warmup_frames_remaining > 0:
+                warmup_frames_remaining -= 1
+                preview_frame = (crop_center_zoom(frame, zoom.current)
+                                 if zoom.digital and zoom.enabled else frame)
+                if args.preview and not show_preview(preview_frame, None, None):
+                    break
+                if warmup_frames_remaining == 0:
+                    print("Warm-up terminé (12 images ignorées).")
+                continue
+
+            # Digital zoom is applied to the captured frame before both face
+            # detection and preview; remember this factor for PTZ calibration.
+            detection_zoom = zoom.current if zoom.digital and zoom.enabled else 1.0
+            zoomed_frame = (crop_center_zoom(frame, detection_zoom)
+                            if zoom.digital and zoom.enabled else frame)
+            detected_now = (
+                frame_index % args.detect_every == 0 or last_face is None
+            )
+
+            if detected_now:
+                small = cv2.resize(zoomed_frame, (DETECT_W, DETECT_H))
+                _, faces = detector.detect(small)
+
+                if faces is None or len(faces) == 0:
+                    last_face = None
+                    has_smooth = False
+                else:
+                    # En présence de plusieurs visages, suivre le plus grand.
+                    last_face = max(faces, key=lambda face: face[2] * face[3])
+
+            if last_face is None:
+                if lost_since is None:
+                    lost_since = time.monotonic()
+
+                # Au démarrage, plutôt que de rester immobile ou de recentrer
+                # en boucle, parcourir progressivement l'axe relatif. Les
+                # commandes sont espacées et plafonnées par --max-delta.
+                now = time.monotonic()
+                if startup_search and now >= next_search_at:
+                    sweep = (0, 1, 0, -1, 0, 1, 0, -1)
+                    direction = sweep[search_step_index % len(sweep)]
+                    search_step_index += 1
+                    next_search_at = now + 1.0
+                    if direction:
+                        search_pan = direction * min(args.max_delta, 120.0)
+                        ptz.move(
+                            search_pan, 0.0, 0.0, args.max_delta,
+                            args.invert_pan, current_invert_tilt,
+                        )
+                        print("Recherche initiale : balayage horizontal progressif.")
+                    if search_step_index >= len(sweep):
+                        # Reboucler lentement tant que le visage demeure perdu.
+                        search_step_index = 0
+
+                if (
+                    not startup_search
+                    and args.lost_recenter > 0
+                    and not recentered_for_loss
+                    and time.monotonic() - lost_since >= args.lost_recenter
+                ):
+                    recentered_for_loss = True
+                    if ptz.center():
+                        print("Visage perdu : recentrage.")
+                        if stop.wait(1.2):
+                            break
+                        ptz.refresh_absolute()
+                    else:
+                        print("Visage perdu : recentrage indisponible.")
+
+                if lost_since is not None:
+                    zoom.update_lost(time.monotonic() - lost_since)
+                if args.preview and not show_preview(zoomed_frame, None, None):
+                    break
+                continue
+
+            lost_since = None
+            recentered_for_loss = False
+            startup_search = False
+
+            # Ne jamais commander plusieurs fois sur la même détection.
+            if detected_now:
+                x, y, w, h = last_face[:4]
+                zoom.update(float(w) / small.shape[1])
+                raw_x = (x + w / 2 - DETECT_W / 2) / detection_zoom
+                raw_y = (y + h / 2 - DETECT_H / 2) / detection_zoom
+
+                if not has_smooth:
+                    smooth_x, smooth_y = raw_x, raw_y
+                    has_smooth = True
+                else:
+                    a = args.smooth
+                    smooth_x = a * raw_x + (1 - a) * smooth_x
+                    smooth_y = a * raw_y + (1 - a) * smooth_y
+
+                # V4L2 : pan positif vers la droite,
+                # tilt positif vers le haut.
+                pan = axis_step(smooth_x, args.deadzone[0], args.kp_pan)
+                tilt = -axis_step(smooth_y, args.deadzone[1], args.kp_tilt)
+
+                if pan or tilt:
+                    ptz.move(
+                        pan, tilt, args.motor_interval, args.max_delta,
+                        args.invert_pan, current_invert_tilt,
+                    )
+
+            if args.preview and not show_preview(
+                zoomed_frame, last_face, (smooth_x * detection_zoom,
+                                           smooth_y * detection_zoom)
+            ):
+                break
+
+    finally:
+        print("\nArrêt et libération des ressources.")
+        if cam is not None:
+            cam.close()
+        if ptz is not None:
+            ptz.close()
+
+
+SETTINGS_PATH = os.path.expanduser("~/.config/Logitech-QuickCam-Sphere-NixOs/settings.json")
+DEFAULT_SETTINGS = {
+    "zoom_max": 3.0, "face_target": 0.25, "speed": 1.0,
+    "deadzone_x": 16.0, "deadzone_y": 12.0,
+    "preview": False, "invert_y": True, "zoom_enabled": True,
+}
+
+# --- V7 : constantes du service ---
+SERVICE_NAME = "follow-me"
+SERVICE_DIR = os.path.expanduser("~/.local/share/Logitech-QuickCam-Sphere-NixOs")
+SERVICE_SCRIPT = os.path.join(SERVICE_DIR, "Logitech-QuickCam-Sphere-NixOs_7.py")
+SERVICE_SHELL = os.path.join(SERVICE_DIR, "shell.nix")
+
+
+def load_settings(args):
+    values = dict(DEFAULT_SETTINGS)
+    values.update({"zoom_max": args.zoom_max,
+                   "face_target": args.zoom_target_ratio,
+                   "deadzone_x": float(args.deadzone[0]),
+                   "deadzone_y": float(args.deadzone[1]),
+                   "preview": bool(args.preview),
+                   "zoom_enabled": not args.no_auto_zoom,
+                   "invert_y": bool(args.invert_tilt)})
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as stream:
+            saved = json.load(stream)
+        if isinstance(saved, dict):
+            for key in values:
+                if key in saved and isinstance(saved[key], type(values[key])):
+                    values[key] = saved[key]
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[AVERTISSEMENT] Réglages illisibles, valeurs par défaut utilisées ({exc}).",
+              file=sys.stderr)
+    return values
+
+
+def save_settings(values):
+    os.makedirs(os.path.dirname(SETTINGS_PATH), mode=0o700, exist_ok=True)
+    temp_path = SETTINGS_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as stream:
+        json.dump(values, stream, ensure_ascii=False, indent=2)
+        stream.write("\n")
+    os.chmod(temp_path, 0o600)
+    os.replace(temp_path, SETTINGS_PATH)
+
+
+def check_startup_prerequisites(args, need_tray):
+    """Contrôle modules, tray/DBus, v4l2-ctl et capacités YuNet."""
+    global cv2, np
+    ensure_nix_environment(need_tray=need_tray, need_gui=bool(args.preview))
+    errors = quick_missing(need_tray=need_tray, need_gui=bool(args.preview))
+    # pystray est facultatif : main() active le mode console si son import échoue.
+    errors = [error for error in errors if error != "module Python pystray"]
+    pystray_import_failed = False
+    if cv2 is None:
+        try:
+            import cv2 as _cv2
+            cv2 = _cv2
+        except ImportError:
+            pass
+    if np is None:
+        try:
+            import numpy as _np
+            np = _np
+        except ImportError:
+            pass
+    # Importer ici une seconde fois après l'éventuel nix-shell.
+    if need_tray:
+        for module, label in (("pystray", "pystray"), ("PIL", "Pillow"),
+                              ("tkinter", "tkinter")):
+            try:
+                __import__(module)
+            except Exception as exc:
+                if module == "pystray":
+                    pystray_import_failed = True
+                    errors.append(f"module Python pystray : {exc}")
+                elif f"module Python {label}" not in errors:
+                    errors.append(f"module Python {label} : {exc}")
+    if need_tray and not pystray_import_failed:
+        available, detail = tray_environment_status()
+        print(f"Vérification du tray : {'[OK]' if available else '[ERREUR]'} {detail}.")
+        if not available:
+            errors.append(detail)
+    if pystray_import_failed:
+        optional_tray_errors = ("module Python pystray", "module Python Pillow",
+                                "module Python tkinter")
+        errors = [error for error in errors
+                  if not error.startswith(optional_tray_errors)]
+    fatal_errors = [error for error in errors
+                    if not error.startswith("module Python pystray : ")]
+    if fatal_errors:
+        errors = fatal_errors
+        if is_nixos() and os.environ.get("Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL"):
+            advice = "Vérifiez l'installation Nix : opencv4 avec enableGtk3, numpy, pystray, pillow, tk et v4l-utils."
+        elif is_nixos():
+            advice = "Impossible de démarrer nix-shell automatiquement ; installez opencv4 (enableGtk3), numpy, pystray, pillow, tk et v4l-utils."
+        else:
+            advice = "Installez les dépendances manquantes (OpenCV YuNet, numpy, v4l-utils et, pour le tray, pystray/Pillow/Tk)."
+        raise RuntimeError("Prérequis manquants : " + ", ".join(errors) + ". " + advice)
+    print("Vérification des prérequis : modules requis et v4l2-ctl disponibles.")
+
+
+def reset_from_menu(device):
+    """Reset matériel équivalent à la commande v4l2-ctl attendue."""
+    target = device
+    if not target:
+        paths = sorted(glob.glob("/dev/v4l/by-id/*-video-index*"))
+        if len(paths) != 1:
+            raise RuntimeError("Choisissez --device si plusieurs nœuds caméra sont présents.")
+        target = paths[0]
+    result = subprocess.run(["v4l2-ctl", "-d", target,
+                             "--set-ctrl=pan_reset=1,tilt_reset=1"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Le reset pan/tilt a échoué.")
+    print("Reset pan/tilt envoyé.")
+
+
+class TrayApplication:
+    """Tkinter reste dans le thread principal; suivi et icône ont leurs threads."""
+    def __init__(self, args, settings):
+        import tkinter as tk
+        from tkinter import messagebox
+        import pystray
+        from PIL import Image, ImageDraw, ImageTk
+        self.tk, self.pystray = tk, pystray
+        self.messagebox = messagebox
+        self.Image, self.ImageDraw, self.ImageTk = Image, ImageDraw, ImageTk
+        self.args = args
+        self.shared = {"lock": threading.Lock(), "values": settings}
+        self.commands = queue.Queue()
+        self.worker = None
+        self.worker_stop = None
+        self.closed = threading.Event()
+        self.root = tk.Tk()
+        self.root.title("Follow Me — Réglages")
+        self.root.resizable(False, False)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_settings)
+        self.root.withdraw()
+        self.preview_window = tk.Toplevel(self.root)
+        self.preview_window.title("Follow Me — Aperçu")
+        self.preview_label = tk.Label(self.preview_window, text="Aperçu en attente…")
+        self.preview_label.pack(padx=8, pady=8)
+        self.preview_photo = None
+        self.preview_window.withdraw()
+        self.vars = {}
+        self.icon = None
+        self._build_settings()
+
+    def _build_settings(self):
+        tk = self.tk
+        frame = tk.Frame(self.root, padx=18, pady=14)
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text="Réglages du suivi", font=("Sans", 14, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        specs = [("zoom_max", "Zoom maximal", 1.0, 8.0, 0.1),
+                 ("face_target", "Taille cible du visage", 0.10, 0.80, 0.01),
+                 ("speed", "Vitesse du suivi", 0.2, 3.0, 0.05),
+                 ("deadzone_x", "Zone morte horizontale (px)", 0, 100, 1),
+                 ("deadzone_y", "Zone morte verticale (px)", 0, 100, 1)]
+        with self.shared["lock"]:
+            values = dict(self.shared["values"])
+        for row, (key, label, low, high, resolution) in enumerate(specs, 1):
+            tk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+            var = tk.DoubleVar(value=values[key])
+            self.vars[key] = var
+            tk.Scale(frame, variable=var, from_=low, to=high, resolution=resolution,
+                     orient="horizontal", length=250, showvalue=True).grid(
+                         row=row, column=1, sticky="ew")
+        for row, (key, label) in enumerate((("preview", "Aperçu vidéo"),
+                                             ("invert_y", "Inverser l’axe Y (caméra tête en bas)")), 6):
+            var = tk.BooleanVar(value=values[key]); self.vars[key] = var
+            tk.Checkbutton(frame, text=label, variable=var).grid(row=row, column=0,
+                                                                   columnspan=2, sticky="w", pady=3)
+        tk.Button(frame, text="Enregistrer", command=self.apply_settings).grid(
+            row=8, column=0, sticky="w", pady=(10, 0))
+        tk.Button(frame, text="Fermer", command=self.hide_settings).grid(
+            row=8, column=1, sticky="e", pady=(10, 0))
+        frame.columnconfigure(1, weight=1)
+
+    def apply_settings(self):
+        with self.shared["lock"]:
+            self.shared["values"].update({key: var.get() for key, var in self.vars.items()})
+            settings = dict(self.shared["values"])
+        try:
+            save_settings(settings)
+            print("Réglages enregistrés.")
+        except OSError as exc:
+            self.messagebox.showerror("Follow Me", f"Enregistrement impossible : {exc}")
+
+    def show_settings(self):
+        self.root.deiconify(); self.root.lift()
+
+    def hide_settings(self):
+        self.root.withdraw()
+
+    def _start_tracking(self):
+        if self.worker is not None and self.worker.is_alive():
+            return
+        self.worker_stop = threading.Event()
+        self.worker = threading.Thread(target=self._tracking_worker,
+                                       name="suivi-visage", daemon=True)
+        self.worker.start()
+        print("Démarrage du suivi demandé.")
+
+    def _tracking_worker(self):
+        args = argparse.Namespace(**vars(self.args))
+        try:
+            run_tracking(args, self.shared, self.worker_stop)
+        except Exception as exc:
+            print(f"Erreur du suivi : {exc}", file=sys.stderr)
+
+    def _stop_tracking(self):
+        if self.worker_stop is not None:
+            self.worker_stop.set()
+            print("Arrêt du suivi demandé.")
+
+    def _toggle_zoom(self):
+        with self.shared["lock"]:
+            self.shared["values"]["zoom_enabled"] = not self.shared["values"]["zoom_enabled"]
+            enabled = self.shared["values"]["zoom_enabled"]
+            snapshot = dict(self.shared["values"])
+        save_settings(snapshot)
+        print(f"Zoom automatique {'activé' if enabled else 'désactivé'}.")
+
+    def _reset(self):
+        try:
+            reset_from_menu(self.args.device)
+        except Exception as exc:
+            print(f"Reset impossible : {exc}", file=sys.stderr)
+
+    def _icon_image(self):
+        image = self.Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = self.ImageDraw.Draw(image)
+        draw.ellipse((5, 5, 59, 59), fill=(37, 99, 235, 255))
+        draw.ellipse((20, 16, 44, 40), outline="white", width=4)
+        draw.arc((13, 24, 51, 54), 15, 165, fill="white", width=4)
+        return image
+
+    def _menu(self):
+        pystray = self.pystray
+        return pystray.Menu(
+            pystray.MenuItem("Démarrer le suivi", lambda icon, item: self.commands.put("start")),
+            pystray.MenuItem("Arrêter le suivi", lambda icon, item: self.commands.put("stop")),
+            pystray.MenuItem("Zoom automatique", lambda icon, item: self.commands.put("zoom"),
+                             checked=lambda item: self.shared["values"]["zoom_enabled"]),
+            pystray.MenuItem("Réinitialiser pan/tilt", lambda icon, item: self.commands.put("reset")),
+            pystray.MenuItem("Réglages…", lambda icon, item: self.commands.put("settings")),
+            pystray.MenuItem("Quitter", lambda icon, item: self.commands.put("quit")),
+        )
+
+    def _run_icon(self):
+        self.icon = self.pystray.Icon("Logitech-QuickCam-Sphere-NixOs", self._icon_image(), "Follow Me", self._menu())
+        try:
+            self.icon.run()
+        except Exception as exc:
+            print(f"Erreur du tray : {exc}", file=sys.stderr)
+            self.commands.put("tray_error")
+
+    def _poll_commands(self):
+        if getattr(self, "_closing", False):
+            return
+        while True:
+            try:
+                command = self.commands.get_nowait()
+            except queue.Empty:
+                break
+            if command == "start":
+                self._start_tracking()
+            elif command == "stop":
+                self._stop_tracking()
+            elif command == "zoom":
+                self._toggle_zoom()
+            elif command == "reset":
+                self._reset()
+            elif command == "settings":
+                self.show_settings()
+            elif command in ("quit", "tray_error"):
+                self.shutdown()
+                return
+            if getattr(self, "_closing", False):
+                return
+
+        try:
+            frame = PREVIEW_QUEUE.get_nowait()
+        except queue.Empty:
+            frame = None
+
+        try:
+            if frame is not None and self.preview_label.winfo_exists():
+                image = self.Image.fromarray(frame[:, :, ::-1])
+                self.preview_photo = self.ImageTk.PhotoImage(image=image)
+                self.preview_label.configure(image=self.preview_photo, text="")
+                if not self.preview_window.winfo_viewable():
+                    self.preview_window.deiconify()
+        except self.tk.TclError:
+            return  # fenêtre détruite pendant l'arrêt
+
+        self._after_id = self.root.after(150, self._poll_commands)
+
+    def shutdown(self):
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        self._closing = True
+
+        if getattr(self, "_after_id", None):
+            try:
+                self.root.after_cancel(self._after_id)
+            except self.tk.TclError:
+                pass
+            self._after_id = None
+
+        self._stop_tracking()
+
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except self.tk.TclError:
+            pass
+
+    def run(self):
+        self.icon_thread = threading.Thread(target=self._run_icon, name="icône-tray", daemon=True)
+        self.icon_thread.start()
+        self.root.after(150, self._poll_commands)
+        self.root.mainloop()
+        self._stop_tracking()
+        if self.worker is not None:
+            self.worker.join(timeout=3)
+        self.closed.set()
+
+
+def run_console_preview(args, stop=None):
+    """Affiche l’aperçu Tk dans le mode terminal sans tray."""
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    root = tk.Tk()
+    root.title("Follow Me — Aperçu")
+    label = tk.Label(root, text="Aperçu en attente…")
+    label.pack(padx=8, pady=8)
+    stop = stop if stop is not None else threading.Event()
+    worker_errors = []
+    photo = {"current": None}
+
+    def tracking_worker():
+        try:
+            run_tracking(args, stop=stop)
+        except Exception as exc:
+            worker_errors.append(exc)
+            stop.set()
+
+    worker = threading.Thread(target=tracking_worker, name="suivi-visage", daemon=True)
+    worker.start()
+
+    def request_stop(_event=None):
+        stop.set()
+
+    root.protocol("WM_DELETE_WINDOW", request_stop)
+    root.bind("<KeyPress-q>", request_stop)
+
+    def poll_preview():
+        try:
+            frame = PREVIEW_QUEUE.get_nowait()
+        except queue.Empty:
+            frame = None
+        if frame is not None:
+            image = Image.fromarray(frame[:, :, ::-1])
+            photo["current"] = ImageTk.PhotoImage(image=image)
+            label.configure(image=photo["current"], text="")
+        if worker.is_alive():
+            root.after(30, poll_preview)
+        else:
+            root.quit()
+
+    root.after(30, poll_preview)
+    root.mainloop()
+    stop.set()
+    worker.join(timeout=3.0)
+    root.destroy()
+    if worker_errors:
+        raise worker_errors[0]
+def build_service_unit(args):
+    """Commande de lancement dans le shell Nix, puis unité systemd user."""
+    extra = [arg for arg in sys.argv[1:]
+             if arg not in ("--install-service", "--uninstall-service")]
+    inner = " ".join(shlex.quote(arg) for arg in [SERVICE_SCRIPT, *extra])
+    exec_start = (
+        f"{shlex.quote(shutil.which('nix-shell') or 'nix-shell')} "
+        f"{SERVICE_SHELL} --run {shlex.quote('python ' + inner)}"
+    )
+    return f"""[Unit]
+Description=Suivi de visage PTZ (Logitech-QuickCam-Sphere-NixOs)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart={exec_start}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+def install_service(args):
+    """Copie le script + shell.nix, installe et active le service user."""
+    if not is_nixos() or shutil.which("nix-shell") is None:
+        raise RuntimeError("Installation du service prévue pour NixOS avec nix-shell.")
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    os.makedirs(SERVICE_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(unit_dir, exist_ok=True)
+
+    shutil.copy2(os.path.abspath(__file__), SERVICE_SCRIPT)
+    model_src = DEFAULT_MODEL
+    if os.path.isfile(model_src):
+        shutil.copy2(model_src, os.path.join(SERVICE_DIR, MODEL_NAME))
+        print(f"Modèle copié : {os.path.join(SERVICE_DIR, MODEL_NAME)}")
+    else:
+        print("[AVERTISSEMENT] Modèle YuNet introuvable à côté du script ; le suivi "
+              "ne démarrera pas. Copie-le dans " + SERVICE_DIR, file=sys.stderr)
+    os.chmod(SERVICE_SCRIPT, 0o700)
+    with open(SERVICE_SHELL, "w", encoding="utf-8") as stream:
+        stream.write(SHELL_NIX)
+    os.chmod(SERVICE_SHELL, 0o600)
+
+    unit_path = os.path.join(unit_dir, f"{SERVICE_NAME}.service")
+    with open(unit_path, "w", encoding="utf-8") as stream:
+        stream.write(build_service_unit(args))
+    print(f"Unité écrite : {unit_path}")
+    print(f"Script copié : {SERVICE_SCRIPT}")
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
+    print(f"Service activé et démarré : systemctl --user status {SERVICE_NAME}")
+    print("Note : le service démarre avec la session graphique ; "
+          "pour les réglages, lance le script normalement (tray) ou édite "
+          "~/.config/Logitech-QuickCam-Sphere-NixOs/settings.json.")
+
+
+def uninstall_service():
+    """Arrête et supprime le service utilisateur."""
+    subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME],
+                   check=False)
+    unit_path = os.path.expanduser(f"~/.config/systemd/user/{SERVICE_NAME}.service")
+    try:
+        os.remove(unit_path)
+    except FileNotFoundError:
+        pass
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "reset-failed"], check=False)
+    print("Service follow-me supprimé (les fichiers dans ~/.local/share/Logitech-QuickCam-Sphere-NixOs "
+          "et les réglages sont conservés).")
+
+def close_previous_instances():
+    """Ferme les autres scripts Logitech-QuickCam-Sphere-NixOs du même utilisateur."""
+    current_pid = os.getpid()
+    current_uid = os.getuid()
+    username = getpass.getuser()
+
+    def is_Logitech-QuickCam-Sphere-NixOs(pid):
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as stream:
+                status = stream.read()
+            uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
+            if int(uid_line.split()[1]) != current_uid:
+                return False
+            with open(f"/proc/{pid}/cmdline", "rb") as stream:
+                argv = [part.decode(errors="replace") for part in stream.read().split(b"\0") if part]
+        except (OSError, StopIteration, ValueError):
+            return False
+        executable = os.path.basename(argv[0]) if argv else ""
+        if executable.startswith("Logitech-QuickCam-Sphere-NixOs") and executable.endswith(".py"):
+            return True
+        for index, argument in enumerate(argv[1:], 1):
+            name = os.path.basename(argument)
+            if argument == "-m" and index + 1 < len(argv):
+                module = argv[index + 1].split(".", 1)[0]
+                if module == "Logitech-QuickCam-Sphere-NixOs":
+                    return True
+            if name == "Logitech-QuickCam-Sphere-NixOs" or (name.startswith("Logitech-QuickCam-Sphere-NixOs") and name.endswith(".py")):
+                return True
+        return False
+
+    previous = []
+    try:
+        pids = (int(entry) for entry in os.listdir("/proc") if entry.isdigit())
+        for pid in pids:
+            if pid != current_pid and is_Logitech-QuickCam-Sphere-NixOs(pid):
+                previous.append(pid)
+    except OSError as exc:
+        print(f"[AVERTISSEMENT] Lecture de /proc impossible : {exc}", file=sys.stderr)
+        return
+
+    if not previous:
+        return
+    print(f"Fermeture de {len(previous)} instance(s) Logitech-QuickCam-Sphere-NixOs précédente(s) de {username}.")
+    for pid in previous:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            continue
+
+    deadline = time.monotonic() + 2.0
+    pending = set(previous)
+    while pending and time.monotonic() < deadline:
+        pending = {pid for pid in pending if is_Logitech-QuickCam-Sphere-NixOs(pid)}
+        if pending:
+            time.sleep(0.1)
+    for pid in pending:
+        if is_Logitech-QuickCam-Sphere-NixOs(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+def main():
+    args = parse_args()
+    if args.uninstall_service:
+        uninstall_service()
+        return
+    if args.install_service:
+        install_service(args)
+        return
+    close_previous_instances()
+    need_tray = not args.no_tray
+    settings = load_settings(args) if need_tray else None
+    if need_tray and settings["preview"]:
+        args.preview = True
+    check_startup_prerequisites(args, need_tray)
+    if need_tray:
+        try:
+            import pystray  # noqa: F401
+        except Exception as exc:
+            print(f"Avertissement : impossible de charger pystray ({exc}) ; poursuite sans icône de tray.",
+                  file=sys.stderr)
+            args.no_tray = True
+            need_tray = False
+    if args.no_tray:
+        stop = threading.Event()
+        def request_stop(_signum, _frame): stop.set()
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        # Mode console historique : les options CLI gardent la priorité et la
+        # boucle de suivi s'exécute dans le thread principal.
+        if args.preview:
+            run_console_preview(args, stop=stop)
+        else:
+            run_tracking(args, stop=stop)
+        return
+    app = TrayApplication(args, settings)
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        app.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError) as exc:
+        print(f"Erreur : {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        if cv2 is not None and isinstance(exc, cv2.error):
+            print(f"Erreur : {exc}", file=sys.stderr)
+            sys.exit(1)
+        raise
