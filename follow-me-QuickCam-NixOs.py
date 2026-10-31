@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-follow-me-QuickCam-NixOs.py — Suivi de visage avec une caméra PTZ (V4L2).
+follow_me.py — Suivi de visage avec une caméra PTZ (V4L2).
+
+Warn kernel Linux 7.0.x :
+v4l2loopback 0.15.3 n'est pas testé/correctement compilé pour le kernel 7.0.x. Les versions 0.15.x du module ont été développées pour les kernels 6.x. 
+Le kernel 7.x a introduit des changements internes dans la couche video4linux2 qui provoquent l'EIO au VIDIOC_STREAMON — le module se charge, crée le device, accepte S_FMT, mais échoue silencieusement au STREAMON.
+
 
 UTILISATION
 -----------
@@ -9,9 +14,9 @@ UTILISATION
 Sur NixOS, lancer simplement le script : si OpenCV ou v4l2-ctl manque,
 le script écrit le shell.nix intégré dans un fichier temporaire puis se
 relance dans nix-shell (venv + opencv-python via pip). Le marqueur
-Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL empêche une relance infinie.
+FOLLOW_ME_IN_NIX_SHELL empêche une relance infinie.
 
-    python3 follow-me-QuickCam-NixOs.py --no-reset --max-delta 200 --preview
+    python3 follow_me.py --no-reset --max-delta 200 --preview
 
 Télécharger le modèle YuNet dans le dossier du script :
 
@@ -21,7 +26,7 @@ Télécharger le modèle YuNet dans le dossier du script :
 Si plusieurs caméras PTZ sont détectées :
 
     ls -l /dev/v4l/by-id/
-    python3 follow-me-QuickCam-NixOs.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 \
+    python3 follow_me.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 \
       --no-reset --max-delta 200 --preview
 
 Au lancement, le script réinitialise les moteurs (désactiver avec
@@ -29,9 +34,47 @@ Au lancement, le script réinitialise les moteurs (désactiver avec
 --no-reset désactive séparément le recentrage initial logiciel.
 Le zoom automatique est actif par défaut (--no-auto-zoom pour le couper) ;
 la cible est réglable avec --zoom-target-ratio.
-
 Le tilt est inversé par défaut. Utiliser --no-invert-tilt pour désactiver
 l'inversion ou --invert-pan pour inverser le pan.
+
+CAMÉRA VIRTUELLE (VirtualVideo)
+-------------------------------
+
+- v4l2loopbackNixOS n'a que la 0.15.3, même pour les kernels 7.x.
+Le problème est confirmé : c'est la version du module qui est le goulot.
+
+Une seule application peut ouvrir la vraie caméra à la fois. Avec
+VirtualVideo (activée via --virtual-video, l'entrée VirtualVideo du menu
+tray ou la case "VirtualVideo (partager le flux)" des réglages), le script
+recopie le flux capturé vers une caméra virtuelle v4l2loopback : les
+autres logiciels (VLC, Cheese, navigateur, Zoom…) lisent alors la copie
+tandis que le script garde la vraie caméra pour le pilotage PTZ.
+
+Prérequis : le module kernel v4l2loopback doit être chargé avec un
+périphérique configuré. Sur NixOS, déclarer dans configuration.nix :
+
+    boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
+    boot.kernelModules = [ "v4l2loopback" ];
+    boot.extraModprobeConfig = ''
+      options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=0
+    '';
+
+puis reconstruire et redémarrer (ou temporairement : sudo modprobe
+v4l2loopback devices=1 video_nr=10 card_label="CamPartagee"
+exclusive_caps=1). Le module doit être chargé avant le démarrage de la
+session graphique et donc avant le service utilisateur follow-me. Ajouter
+aussi l'utilisateur au groupe video (NixOS :
+users.users.<nom>.extraGroups = [ "video" ];), puis fermer/réouvrir la
+session pour que le gestionnaire systemd utilisateur hérite du groupe.
+Les autres applications ouvrent ensuite /dev/video10 :
+
+    vlc v4l2:///dev/video10
+
+Si l'option est demandée mais qu'aucun périphérique loopback n'est
+trouvé, un avertissement détaillé (bloc d'explication avec la
+configuration NixOS ci-dessus) est affiché et le suivi continue sans
+partage. Le nœud loopback est détecté automatiquement ; --virtual-device
+permet de l'imposer.
 
 Diagnostic :
 
@@ -43,17 +86,17 @@ et une fois pour la capture vidéo (dépend du pilote V4L2).
 Arrêt : Ctrl+C ou touche q lorsque la prévisualisation est active.
 
 # Installer + démarrer immédiatement (redémarre avec chaque session NixOS) :
-python3 follow-me-QuickCam-NixOs.py --install-service
+python3 follow_me.py --install-service
 
 # Avec des options persistantes (elles sont figées dans l'unité) :
-python3 follow-me-QuickCam-NixOs.py --install-service --no-tray --no-reset --max-delta 200
+python3 follow_me.py --install-service --no-tray --no-reset --max-delta 200
 
 # Vérifier :
 systemctl --user status follow-me
 journalctl --user -u follow-me -f
 
 # Désinstaller :
-python3 follow-me-QuickCam-NixOs.py --uninstall-service
+python3 follow_me.py --uninstall-service
 
 """
 
@@ -132,6 +175,7 @@ in pkgs.mkShell {
       ps.numpy ps.pystray ps.pillow ps.tkinter ps.pygobject3
     ]))
     pkgs.tk pkgs.v4l-utils pkgs.gtk3 pkgs.libayatana-appindicator pkgs.gobject-introspection
+    pkgs.ffmpeg
   ];
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
     stdenv.cc.cc.lib zlib libGL glib gtk3 libayatana-appindicator dbus
@@ -145,6 +189,47 @@ in pkgs.mkShell {
   '';
 }
 """
+
+V4L2LOOPBACK_NIXOS_CONFIG = """\
+# NixOS : déclarer le module kernel, ex. dans configuration.nix :
+boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
+boot.kernelModules = [ "v4l2loopback" ];
+boot.extraModprobeConfig = ''
+  options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=1
+'';
+"""
+
+
+def print_virtual_video_warning():
+    """Bloc d'explication complet quand le loopback est absent."""
+    print(
+        "\n"
+        "============================================================\n"
+        " AVERTISSEMENT — VirtualVideo indisponible\n"
+        "============================================================\n"
+        "Aucun périphérique v4l2loopback n'a été détecté.\n"
+        "Le suivi continue normalement, mais le flux n'est PAS\n"
+        "partagé avec les autres applications (VLC, Cheese,\n"
+        "navigateur, Zoom…).\n\n"
+        "Une seule application peut ouvrir la vraie caméra à la\n"
+        "fois : tant que ce script la détient, les autres logiciels\n"
+        "ne peuvent pas y accéder. Pour leur donner une copie du\n"
+        "signal, le module kernel v4l2loopback doit être chargé.\n\n"
+        "--- À ajouter à /etc/nixos/configuration.nix ---\n"
+        f"{V4L2LOOPBACK_NIXOS_CONFIG}"
+        "------------------------------------------------\n\n"
+        "Puis :\n"
+        "  sudo nixos-rebuild switch   # et redémarrer\n"
+        "ou temporairement :\n"
+        "  sudo modprobe v4l2loopback devices=1 video_nr=10 \\\n"
+        "    card_label=\"CamPartagee\" exclusive_caps=1\n\n"
+        "Les autres applications ouvriront alors /dev/video10 :\n"
+        "  vlc v4l2:///dev/video10\n"
+        "Un nœud précis peut être imposé avec --virtual-device.\n"
+        "============================================================\n",
+        file=sys.stderr,
+    )
+
 
 class V4L2Control(ctypes.Structure):
     _fields_ = [
@@ -217,7 +302,7 @@ def quick_missing(need_tray=False, need_gui=False):
 def ensure_nix_environment(need_tray=False, need_gui=False):
     """Sur NixOS, relance dans le shell Nix intégré si un prérequis manque."""
     missing = quick_missing(need_tray, need_gui)
-    if not missing or os.environ.get("Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL"):
+    if not missing or os.environ.get("FOLLOW_ME_IN_NIX_SHELL"):
         return
     if not (is_nixos() and shutil.which("nix-shell")):
         return
@@ -228,7 +313,7 @@ def ensure_nix_environment(need_tray=False, need_gui=False):
     print("NixOS détecté : lancement du shell de dépendances intégré…", file=sys.stderr)
     script = os.path.abspath(__file__)
     cmd = "python " + " ".join(shlex.quote(arg) for arg in [script, *sys.argv[1:]])
-    env = {**os.environ, "Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL": "1"}
+    env = {**os.environ, "FOLLOW_ME_IN_NIX_SHELL": "1"}
     os.execvpe("nix-shell", ["nix-shell", shell_file, "--run", cmd], env)
 
 
@@ -236,7 +321,8 @@ def tray_environment_status():
     """Vérifie la session DBus et le watcher StatusNotifier de Plasma."""
     if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
         return False, "aucune session DBus détectée"
-    if "kde" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower() and        "plasma" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
+    if "kde" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower() and \
+            "plasma" not in os.environ.get("XDG_CURRENT_DESKTOP", "").lower():
         return False, "session Plasma/KDE non détectée"
     probe = shutil.which("busctl")
     if probe:
@@ -248,8 +334,6 @@ def tray_environment_status():
                 return True, "session DBus et StatusNotifier disponibles"
         except (OSError, subprocess.SubprocessError):
             pass
-    # busctl status peut échouer selon les versions DBus : au minimum, confirmer
-    # que la session bus répond; le backend pystray déterminera le reste.
     dbus_send = shutil.which("dbus-send")
     if dbus_send:
         try:
@@ -262,8 +346,6 @@ def tray_environment_status():
         except (OSError, subprocess.SubprocessError):
             pass
     return False, "service StatusNotifier/DBus indisponible dans cette session"
-
-
 
 # ----------------------------------------------------------------------
 # Vérification détaillée des prérequis
@@ -287,14 +369,12 @@ def check_prerequisites(args):
 
     print("Vérification des prérequis :")
 
-    # OpenCV et module de détection de visages
     ok(f"OpenCV {cv2.__version__}")
     if hasattr(cv2, "FaceDetectorYN"):
         ok("cv2.FaceDetectorYN disponible")
     else:
         fail("cv2.FaceDetectorYN absent : OpenCV >= 4.5.4 requis")
 
-    # Modèle YuNet
     model = os.path.expanduser(args.model)
     if os.path.isfile(model):
         if os.path.getsize(model) < 100_000:
@@ -309,7 +389,6 @@ def check_prerequisites(args):
             "face_detection_yunet_2023mar.onnx"
         )
 
-    # Backend V4L2 d'OpenCV
     try:
         build = cv2.getBuildInformation()
     except cv2.error:
@@ -327,16 +406,12 @@ def check_prerequisites(args):
     elif v4l:
         ok("Support V4L2 dans OpenCV")
 
-    # Périphérique caméra
     if args.device:
         dev = os.path.expanduser(args.device)
         if not os.path.exists(dev):
             fail(f"Périphérique introuvable : {dev}")
         elif not os.access(dev, os.R_OK | os.W_OK):
-            fail(
-                f"Droits insuffisants sur {dev} "
-                "(ajoute ton utilisateur au groupe 'video')"
-            )
+            fail(f"Droits insuffisants sur {dev} (ajoute ton utilisateur au groupe 'video')")
         else:
             ok(f"Périphérique accessible : {dev}")
     else:
@@ -346,14 +421,10 @@ def check_prerequisites(args):
         else:
             denied = [p for p in paths if not os.access(p, os.R_OK | os.W_OK)]
             if denied:
-                fail(
-                    "Droits insuffisants sur : " + ", ".join(denied)
-                    + " (groupe 'video' ?)"
-                )
+                fail("Droits insuffisants sur : " + ", ".join(denied) + " (groupe 'video' ?)")
             else:
                 ok(f"{len(paths)} nœud(s) vidéo accessible(s)")
 
-    # v4l2-ctl (diagnostic seulement)
     if shutil.which("v4l2-ctl"):
         ok("v4l2-ctl disponible")
     elif args.no_start_reset:
@@ -364,23 +435,28 @@ def check_prerequisites(args):
             "matériel de démarrage (ou utilise --no-start-reset)"
         )
 
-    # Le diagnostic de lancement détaillé est émis par ZoomController après
-    # sélection du véritable nœud PTZ; aucun échec de détection n'est silencieux.
     if args.no_auto_zoom:
         ok("Zoom automatique désactivé par option")
     elif not shutil.which("v4l2-ctl"):
         warn("Zoom auto désactivé : v4l2-ctl absent.")
 
-    # Prévisualisation
+    # VirtualVideo : signaler tôt l'absence probable de loopback/ffmpeg.
+    if getattr(args, "virtual_video", False):
+        if shutil.which("ffmpeg") is None:
+            warn("VirtualVideo : ffmpeg absent ; la caméra virtuelle ne pourra pas être alimentée.")
+        if find_loopback_device(
+                os.path.expanduser(args.virtual_device)
+                if getattr(args, "virtual_device", None) else None) is None:
+            warn("VirtualVideo : aucun périphérique v4l2loopback détecté ; "
+                 "voir le bloc d'explication affiché au démarrage du suivi.")
+
     if args.preview:
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-            fail("--preview demandé mais aucun environnement graphique "
-                 "(DISPLAY / WAYLAND_DISPLAY vides)")
+            fail("--preview demandé mais aucun environnement graphique (DISPLAY / WAYLAND_DISPLAY vides)")
         else:
             gui = None
             for line in build.splitlines():
-                if line.strip().startswith(("GTK+:", "GTK:", "QT:", "Win32 UI:",
-                                            "Cocoa:")):
+                if line.strip().startswith(("GTK+:", "GTK:", "QT:", "Win32 UI:", "Cocoa:")):
                     if "YES" in line:
                         gui = line.strip()
                         break
@@ -396,9 +472,7 @@ def check_prerequisites(args):
     if warnings:
         print(f"  {len(warnings)} avertissement(s).")
     if errors:
-        raise RuntimeError(
-            f"{len(errors)} prérequis manquant(s) ; corrige-les puis relance."
-        )
+        raise RuntimeError(f"{len(errors)} prérequis manquant(s) ; corrige-les puis relance.")
     print("Tous les prérequis bloquants sont satisfaits.\n")
 
 
@@ -423,7 +497,6 @@ class PTZCamera:
         self.path = path
         self.fd = None
         self.last_motor_ts = 0.0
-
         try:
             self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             self._detect_caps()
@@ -434,20 +507,17 @@ class PTZCamera:
     def query(self, cid, require_read=False):
         q = V4L2QueryCtrl()
         q.id = cid
-
         try:
             fcntl.ioctl(self.fd, VIDIOC_QUERYCTRL, q)
         except OSError as exc:
             if exc.errno in (errno.EINVAL, errno.ENOTTY):
                 return None
             raise
-
         forbidden = FLAG_DISABLED | FLAG_READ_ONLY | FLAG_INACTIVE
         if q.flags & forbidden:
             return None
         if require_read and q.flags & FLAG_WRITE_ONLY:
             return None
-
         return q.minimum, q.maximum, max(1, q.step)
 
     def get(self, cid):
@@ -462,13 +532,11 @@ class PTZCamera:
     def _detect_caps(self):
         pan = self.query(PAN_ABS, require_read=True)
         tilt = self.query(TILT_ABS, require_read=True)
-
         if pan is not None and tilt is not None:
             try:
                 pan_value = self.get(PAN_ABS)
                 tilt_value = self.get(TILT_ABS)
             except OSError:
-                # Certains pilotes exposent des contrôles non lisibles.
                 pass
             else:
                 self.absolute = True
@@ -480,16 +548,12 @@ class PTZCamera:
                 self.pan_sent = pan_value
                 self.tilt_sent = tilt_value
                 return
-
         pan = self.query(PAN_REL)
         tilt = self.query(TILT_REL)
-
         if pan is None or tilt is None:
             raise RuntimeError(
-                f"{self.path} : contrôles pan/tilt absolus lisibles "
-                "ou relatifs indisponibles."
+                f"{self.path} : contrôles pan/tilt absolus lisibles ou relatifs indisponibles."
             )
-
         self.absolute = False
         self.mode = "relatif"
         self.pan_range = pan
@@ -505,18 +569,11 @@ class PTZCamera:
             self.tilt_target = float(self.tilt_sent)
 
     def center(self):
-        """
-        Recentrage absolu au milieu de chaque plage.
-        En mode relatif, utilise les boutons reset s'ils sont disponibles.
-        Renvoie False si le recentrage relatif n'est pas disponible.
-        """
         if self.absolute:
             pmin, pmax, _ = self.pan_range
             tmin, tmax, _ = self.tilt_range
-
             pan = snap((pmin + pmax) / 2, self.pan_range)
             tilt = snap((tmin + tmax) / 2, self.tilt_range)
-
             self.set(PAN_ABS, pan)
             self.set(TILT_ABS, tilt)
             self.pan_sent = pan
@@ -526,79 +583,52 @@ class PTZCamera:
         else:
             if self.query(PAN_RESET) is None or self.query(TILT_RESET) is None:
                 return False
-
             self.set(PAN_RESET, 1)
             self.set(TILT_RESET, 1)
             self.pan_pending = 0.0
             self.tilt_pending = 0.0
-
         self.last_motor_ts = time.monotonic()
         return True
 
-    def move(
-        self, pan_delta, tilt_delta, min_interval, max_delta,
-        invert_pan=False, invert_tilt=True,
-    ):
-        """Applique la correction avec inversion au moment de la commande."""
+    def move(self, pan_delta, tilt_delta, min_interval, max_delta,
+             invert_pan=False, invert_tilt=True):
         pan_delta = -pan_delta if invert_pan else pan_delta
         tilt_delta = -tilt_delta if invert_tilt else tilt_delta
         now = time.monotonic()
         if now - self.last_motor_ts < min_interval:
             return False
-
         pan_delta = clamp(pan_delta, -max_delta, max_delta)
         tilt_delta = clamp(tilt_delta, -max_delta, max_delta)
-
         if self.absolute:
             pmin, pmax, _ = self.pan_range
             tmin, tmax, _ = self.tilt_range
-
-            # Conserver les fractions permet d'atteindre le pas matériel
-            # même lorsque chaque correction est petite.
-            self.pan_target = clamp(
-                self.pan_target + pan_delta, pmin, pmax
-            )
-            self.tilt_target = clamp(
-                self.tilt_target + tilt_delta, tmin, tmax
-            )
-
+            self.pan_target = clamp(self.pan_target + pan_delta, pmin, pmax)
+            self.tilt_target = clamp(self.tilt_target + tilt_delta, tmin, tmax)
             pan = snap(self.pan_target, self.pan_range)
             tilt = snap(self.tilt_target, self.tilt_range)
             changed = False
-
             if pan != self.pan_sent:
                 self.set(PAN_ABS, pan)
                 self.pan_sent = pan
                 changed = True
-
             if tilt != self.tilt_sent:
                 self.set(TILT_ABS, tilt)
                 self.tilt_sent = tilt
                 changed = True
         else:
-            # Accumulation bornée : pas de longue file de mouvements
-            # en cas de petites corrections répétées.
-            self.pan_pending = clamp(
-                self.pan_pending + pan_delta, -max_delta, max_delta
-            )
-            self.tilt_pending = clamp(
-                self.tilt_pending + tilt_delta, -max_delta, max_delta
-            )
-
+            self.pan_pending = clamp(self.pan_pending + pan_delta, -max_delta, max_delta)
+            self.tilt_pending = clamp(self.tilt_pending + tilt_delta, -max_delta, max_delta)
             pan = snap(self.pan_pending, self.pan_range)
             tilt = snap(self.tilt_pending, self.tilt_range)
             changed = False
-
             if pan:
                 self.set(PAN_REL, pan)
                 self.pan_pending -= pan
                 changed = True
-
             if tilt:
                 self.set(TILT_REL, tilt)
                 self.tilt_pending -= tilt
                 changed = True
-
         if changed:
             self.last_motor_ts = now
         return changed
@@ -612,7 +642,6 @@ class PTZCamera:
 def select_camera(device):
     if device:
         return PTZCamera(device)
-
     paths = sorted(glob.glob("/dev/v4l/by-id/*-video-index*"))
     preferred = "/dev/v4l/by-id/usb-046d_08b5-video-index0"
     if preferred in paths:
@@ -621,42 +650,31 @@ def select_camera(device):
     candidates = []
     errors = []
     seen = set()
-
     for path in paths:
         real = os.path.realpath(path)
         if real in seen:
             continue
         seen.add(real)
-
         try:
             candidates.append(PTZCamera(path))
         except (OSError, RuntimeError) as exc:
             errors.append(f"  {path} : {exc}")
-
     if len(candidates) == 1:
         return candidates[0]
-
     for camera in candidates:
         camera.close()
-
     if len(candidates) > 1:
         choices = "\n".join(f"  {camera.path}" for camera in candidates)
-        raise RuntimeError(
-            "Plusieurs nœuds PTZ détectés ; choisis-en un avec --device :\n"
-            + choices
-        )
-
+        raise RuntimeError("Plusieurs nœuds PTZ détectés ; choisis-en un avec --device :\n" + choices)
     detail = "\n".join(errors) if errors else "  Aucun nœud by-id trouvé."
     raise RuntimeError(
         "Aucune caméra PTZ utilisable détectée.\n"
         f"{detail}\n"
-        "Vérifie les droits et les contrôles avec v4l2-ctl, "
-        "ou indique le nœud avec --device."
+        "Vérifie les droits et les contrôles avec v4l2-ctl, ou indique le nœud avec --device."
     )
 
 
 def query_zoom_control(device):
-    """Trouve un contrôle zoom V4L2 exploitable et lit ses bornes/flags."""
     try:
         result = subprocess.run(
             ["v4l2-ctl", "-d", device, "--list-ctrls"],
@@ -666,13 +684,8 @@ def query_zoom_control(device):
     except (OSError, subprocess.SubprocessError) as exc:
         detail = getattr(exc, "stderr", None)
         return None, (detail.strip() if detail else str(exc))
-
-    # Préférence aux commandes absolues; les contrôles relatifs sont utilisés
-    # uniquement en dernier recours, puisqu'ils expriment un déplacement.
     controls = {}
     for line in result.stdout.splitlines():
-        # v4l2-ctl versions may include a hexadecimal control ID between
-        # the name and type: zoom_absolute 0x009a090d (int) : ...
         match = re.match(
             r"^\s*(zoom_absolute|zoom_continuous|zoom_relative)"
             r"(?:\s+0x[0-9a-fA-F]+)?\s+\(([^)]*)\)\s*:", line
@@ -685,7 +698,6 @@ def query_zoom_control(device):
         flags_match = re.search(r"\bflags=([^ ]+)", line)
         flags = flags_match.group(1).strip("[]") if flags_match else ""
         controls[name] = (kind, values, flags, line.strip())
-
     for name in ("zoom_absolute", "zoom_continuous", "zoom_relative"):
         if name not in controls:
             continue
@@ -701,7 +713,6 @@ def query_zoom_control(device):
             "default": values.get("default", values["min"]),
             "relative": name != "zoom_absolute",
         }, None
-
     if controls:
         details = "; ".join(f"{name}: {info[2] or 'bornes indisponibles'}"
                              for name, info in controls.items())
@@ -744,11 +755,8 @@ class ZoomController:
             self.max_step = max(self.control_step,
                                 int(round(self.max_step / self.control_step)) * self.control_step)
             if self.info["relative"]:
-                # Relative/continuous controls are pulses; they have no
-                # meaningful persistent position to read back.
                 if not (self.minimum < 0 < self.maximum):
-                    print(f"Zoom auto désactivé : {self.control} ne fournit pas "
-                          "de plage bidirectionnelle exploitable.", file=sys.stderr)
+                    print(f"Zoom auto désactivé : {self.control} ne fournit pas de plage bidirectionnelle exploitable.", file=sys.stderr)
                     self.enabled = False
                     self.current = None
                 elif enabled:
@@ -774,11 +782,8 @@ class ZoomController:
             self.enabled = False
 
     def _set_value(self, value, ratio=None):
-        """Envoie une commande et expose toute erreur renvoyée par v4l2-ctl."""
         relative = self.info["relative"]
         if relative:
-            # A signed command is interpreted as direction by these controls;
-            # cap the pulse to the advertised legal range.
             value = max(self.minimum, min(self.maximum, int(value)))
             if value == 0:
                 return False
@@ -808,13 +813,11 @@ class ZoomController:
         return True
 
     def reset(self):
-        """Remet le zoom absolu à sa valeur par défaut; pas d'impulsion relative."""
         if self.info is None or self.current is None or self.info["relative"]:
             return False
         return self._set_value(self.info.get("default", self.minimum))
 
     def update(self, face_ratio):
-        """Ajuste le zoom au ratio largeur visage/image, y compris visage centré."""
         if not self.enabled or self.current is None:
             return False
         if self.filtered_ratio is None:
@@ -832,13 +835,8 @@ class ZoomController:
         direction = 1 if self.filtered_ratio < low else -1
         ratio = self.filtered_ratio
         if self.digital:
-            # Face ratio is measured in the already digitally zoomed frame.
-            # Scale the current zoom by the ratio error to estimate the target.
-            target = clamp(self.current * self.target_ratio / max(ratio, 1e-6),
-                           1.0, self.max_zoom)
+            target = clamp(self.current * self.target_ratio / max(ratio, 1e-6), 1.0, self.max_zoom)
             delta = self.smoothing * (target - self.current)
-            # A bounded per-command change avoids abrupt crop jumps even for
-            # a newly detected, very small/large face.
             delta = clamp(delta, -0.08, 0.08)
             if abs(delta) < 0.001:
                 return False
@@ -849,13 +847,10 @@ class ZoomController:
         if self.info["relative"]:
             value = self.maximum if direction > 0 else self.minimum
         else:
-            value = clamp(self.current + direction * self.max_step,
-                          self.minimum, self.maximum)
+            value = clamp(self.current + direction * self.max_step, self.minimum, self.maximum)
         return self._set_value(value, ratio=ratio)
 
-
     def update_lost(self, lost_seconds):
-        """Après une longue perte, dézoome doucement pour faciliter la reprise."""
         if not self.enabled or not self.digital or self.current <= 1.0:
             return False
         now = time.monotonic()
@@ -867,7 +862,6 @@ class ZoomController:
 
 
 def crop_center_zoom(frame, factor):
-    """Centre-crop par factor puis redimensionne à la taille initiale."""
     factor = max(1.0, float(factor))
     if factor <= 1.0:
         return frame.copy()
@@ -881,32 +875,87 @@ def crop_center_zoom(frame, factor):
 
 
 def reset_camera(device, wait=3.0):
-    """Réinitialise les axes de la caméra avant l'ouverture de la capture.
-
-    La commande v4l2-ctl vise les contrôles usuels Logitech PTZ. Une erreur
-    n'empêche pas de poursuivre : certains pilotes ne les exposent pas.
-    """
-    command = [
-        "v4l2-ctl", "-d", device,
-        "--set-ctrl=pan_reset=1,tilt_reset=1",
-    ]
+    command = ["v4l2-ctl", "-d", device, "--set-ctrl=pan_reset=1,tilt_reset=1"]
     try:
-        subprocess.run(
-            command, check=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, timeout=10,
-        )
+        subprocess.run(command, check=True, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError) as exc:
         detail = getattr(exc, "stderr", None)
         detail = detail.strip() if detail else str(exc)
-        print(
-            f"[AVERTISSEMENT] Reset initial non exécuté par v4l2-ctl : {detail}",
-            file=sys.stderr,
-        )
+        print(f"[AVERTISSEMENT] Reset initial non exécuté par v4l2-ctl : {detail}", file=sys.stderr)
         return False
-
     print(f"Reset pan/tilt envoyé ; stabilisation {wait:g} s…")
     time.sleep(max(0.0, wait))
     return True
+
+
+# ----------------------------------------------------------------------
+# Caméra virtuelle (v4l2loopback) — VirtualVideo
+# ----------------------------------------------------------------------
+
+def find_loopback_device(preferred=None):
+    """Trouve le /dev/videoN d'un périphérique v4l2loopback."""
+    if preferred:
+        return preferred if os.path.exists(preferred) else None
+    for base in sorted(glob.glob("/sys/class/video4linux/video*")):
+        try:
+            with open(os.path.join(base, "name"), encoding="utf-8") as stream:
+                name = stream.read().lower()
+        except OSError:
+            continue
+        if "v4l2 loopback" in name:
+            return "/dev/" + os.path.basename(base)
+    return None
+
+
+class VirtualFeeder:
+    """Recopie chaque frame capturée vers le périphérique virtuel via ffmpeg.
+
+    Un seul processus peut lire la vraie caméra : FreshCamera la détient pour
+    le pilotage PTZ et ffmpeg reçoit les images BGR via stdin. ffmpeg n'ouvre
+    donc PAS /dev/video0 (cela provoquerait « Device busy ») ; il convertit
+    les images et les écrit en YUYV 4:2:2 dans le périphérique loopback.
+    """
+
+    def __init__(self, virtual, width, height, fps):
+        cmd = [
+            "ffmpeg", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "pipe:0",
+            "-pix_fmt", "yuv420p", "-s", f"{width}x{height}",
+            "-r", str(fps), "-f", "v4l2", virtual,
+        ]
+        self.virtual = virtual
+        self.proc = None
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Lancement de ffmpeg impossible : {exc}") from exc
+
+    def feed(self, frame):
+        if self.proc is None or self.proc.stdin is None:
+            return
+        try:
+            self.proc.stdin.write(frame.tobytes())
+        except (BrokenPipeError, OSError):
+            print("[AVERTISSEMENT] Flux virtuel interrompu ; feeder arrêté.", file=sys.stderr)
+            self.stop()
+
+    def stop(self):
+        if self.proc is None:
+            return
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=3)
+        except subprocess.SubprocessError:
+            self.proc.kill()
+        self.proc = None
 
 
 # ----------------------------------------------------------------------
@@ -914,23 +963,18 @@ def reset_camera(device, wait=3.0):
 # ----------------------------------------------------------------------
 
 class FreshCamera:
-    """
-    Le thread possède VideoCapture et le libère lui-même.
-    La dernière image seulement est conservée.
-    """
+    """Le thread possède VideoCapture et le libère lui-même."""
 
     def __init__(self, path, width, height, fps):
         self.path = path
         self.width = width
         self.height = height
         self.fps = fps
-
         self.stop = threading.Event()
         self.lock = threading.Lock()
         self.frame = None
         self.seq = 0
         self.error = None
-
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
 
@@ -940,23 +984,19 @@ class FreshCamera:
             cap = cv2.VideoCapture(self.path, cv2.CAP_V4L2)
             if not cap.isOpened():
                 raise RuntimeError(f"Impossible d'ouvrir {self.path} en capture.")
-
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_FPS, self.fps)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
             while not self.stop.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     self.stop.wait(0.02)
                     continue
-
                 with self.lock:
                     self.frame = frame
                     self.seq += 1
-
         except Exception as exc:
             with self.lock:
                 self.error = exc
@@ -976,14 +1016,8 @@ class FreshCamera:
         self.stop.set()
         self.thread.join(timeout=2.0)
         if self.thread.is_alive():
-            print(
-                "Attention : le pilote bloque encore une lecture caméra ; "
-                "le thread de capture n'a pas terminé.",
-                file=sys.stderr,
-            )
+            print("Attention : le pilote bloque encore une lecture caméra ; le thread de capture n'a pas terminé.", file=sys.stderr)
 
-
-# ----------------------------------------------------------------------
 # Suivi
 # ----------------------------------------------------------------------
 
@@ -1066,6 +1100,10 @@ def parse_args():
     p.add_argument("--zoom-step", type=float, default=None,
                    help="pas maximal par commande ; défaut : 3 pas du contrôle caméra")
     p.add_argument("--preview", action="store_true")
+    p.add_argument("--virtual-video", action="store_true",
+                   help="partager le flux vers un périphérique v4l2loopback")
+    p.add_argument("--virtual-device",
+                   help="nœud loopback à utiliser (détection automatique sinon)")
     p.add_argument("--no-tray", action="store_true",
                    help="mode terminal sans icône ni panneau de réglages")
     p.add_argument("--no-reset", action="store_true",
@@ -1129,6 +1167,7 @@ def run_tracking(args, live_settings=None, stop=None):
         args.invert_tilt = initial["invert_y"]
         args.preview = initial["preview"]
         args.no_auto_zoom = not initial["zoom_enabled"]
+        args.virtual_video = bool(initial.get("virtual_video", False))
     check_prerequisites(args)
     model = os.path.expanduser(args.model)
 
@@ -1143,6 +1182,7 @@ def run_tracking(args, live_settings=None, stop=None):
 
     ptz = None
     cam = None
+    feeder = None
 
     try:
         ptz = select_camera(args.device)
@@ -1171,6 +1211,20 @@ def run_tracking(args, live_settings=None, stop=None):
                 print("Zoom déjà à sa valeur de reset.")
 
         cam = FreshCamera(ptz.path, args.width, args.height, args.fps)
+        if getattr(args, "virtual_video", False):
+            virtual = find_loopback_device(
+                os.path.expanduser(args.virtual_device) if args.virtual_device else None)
+            if virtual is None:
+                print_virtual_video_warning()
+            elif shutil.which("ffmpeg") is None:
+                print("[AVERTISSEMENT] VirtualVideo demandée mais ffmpeg est introuvable ; partage désactivé.",
+                      file=sys.stderr)
+            else:
+                try:
+                    feeder = VirtualFeeder(virtual, args.width, args.height, args.fps)
+                    print(f"VirtualVideo active : flux publié vers {virtual}.")
+                except (OSError, RuntimeError) as exc:
+                    print(f"[AVERTISSEMENT] Démarrage VirtualVideo impossible : {exc}", file=sys.stderr)
 
         last_seq = -1
         last_frame_at = time.monotonic()
@@ -1231,6 +1285,8 @@ def run_tracking(args, live_settings=None, stop=None):
             last_seq = seq
             last_frame_at = time.monotonic()
             frame_index += 1
+            if feeder is not None:
+                feeder.feed(frame)
 
             height, width = frame.shape[:2]
             if width > MAX_W or height > MAX_H:
@@ -1368,23 +1424,26 @@ def run_tracking(args, live_settings=None, stop=None):
 
     finally:
         print("\nArrêt et libération des ressources.")
+        if feeder is not None:
+            feeder.stop()
         if cam is not None:
             cam.close()
         if ptz is not None:
             ptz.close()
 
 
-SETTINGS_PATH = os.path.expanduser("~/.config/Logitech-QuickCam-Sphere-NixOs/settings.json")
+SETTINGS_PATH = os.path.expanduser("~/.config/follow_me/settings.json")
 DEFAULT_SETTINGS = {
     "zoom_max": 3.0, "face_target": 0.25, "speed": 1.0,
     "deadzone_x": 16.0, "deadzone_y": 12.0,
     "preview": False, "invert_y": True, "zoom_enabled": True,
+    "virtual_video": False,
 }
 
 # --- V7 : constantes du service ---
 SERVICE_NAME = "follow-me"
-SERVICE_DIR = os.path.expanduser("~/.local/share/Logitech-QuickCam-Sphere-NixOs")
-SERVICE_SCRIPT = os.path.join(SERVICE_DIR, "Logitech-QuickCam-Sphere-NixOs_7.py")
+SERVICE_DIR = os.path.expanduser("~/.local/share/follow_me")
+SERVICE_SCRIPT = os.path.join(SERVICE_DIR, "follow_me_7.py")
 SERVICE_SHELL = os.path.join(SERVICE_DIR, "shell.nix")
 
 
@@ -1396,7 +1455,8 @@ def load_settings(args):
                    "deadzone_y": float(args.deadzone[1]),
                    "preview": bool(args.preview),
                    "zoom_enabled": not args.no_auto_zoom,
-                   "invert_y": bool(args.invert_tilt)})
+                   "invert_y": bool(args.invert_tilt),
+                   "virtual_video": bool(args.virtual_video)})
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as stream:
             saved = json.load(stream)
@@ -1468,7 +1528,7 @@ def check_startup_prerequisites(args, need_tray):
                     if not error.startswith("module Python pystray : ")]
     if fatal_errors:
         errors = fatal_errors
-        if is_nixos() and os.environ.get("Logitech-QuickCam-Sphere-NixOs_IN_NIX_SHELL"):
+        if is_nixos() and os.environ.get("FOLLOW_ME_IN_NIX_SHELL"):
             advice = "Vérifiez l'installation Nix : opencv4 avec enableGtk3, numpy, pystray, pillow, tk et v4l-utils."
         elif is_nixos():
             advice = "Impossible de démarrer nix-shell automatiquement ; installez opencv4 (enableGtk3), numpy, pystray, pillow, tk et v4l-utils."
@@ -1517,6 +1577,7 @@ class TrayApplication:
         self.root.protocol("WM_DELETE_WINDOW", self.hide_settings)
         self.root.withdraw()
         self.preview_window = tk.Toplevel(self.root)
+        self.preview_window.protocol("WM_DELETE_WINDOW", self._hide_preview)
         self.preview_window.title("Follow Me — Aperçu")
         self.preview_label = tk.Label(self.preview_window, text="Aperçu en attente…")
         self.preview_label.pack(padx=8, pady=8)
@@ -1547,14 +1608,15 @@ class TrayApplication:
                      orient="horizontal", length=250, showvalue=True).grid(
                          row=row, column=1, sticky="ew")
         for row, (key, label) in enumerate((("preview", "Aperçu vidéo"),
-                                             ("invert_y", "Inverser l’axe Y (caméra tête en bas)")), 6):
+                                             ("invert_y", "Inverser l’axe Y (caméra tête en bas)"),
+                                             ("virtual_video", "VirtualVideo (partager le flux)")), 6):
             var = tk.BooleanVar(value=values[key]); self.vars[key] = var
             tk.Checkbutton(frame, text=label, variable=var).grid(row=row, column=0,
                                                                    columnspan=2, sticky="w", pady=3)
         tk.Button(frame, text="Enregistrer", command=self.apply_settings).grid(
-            row=8, column=0, sticky="w", pady=(10, 0))
+            row=9, column=0, sticky="w", pady=(10, 0))
         tk.Button(frame, text="Fermer", command=self.hide_settings).grid(
-            row=8, column=1, sticky="e", pady=(10, 0))
+            row=9, column=1, sticky="e", pady=(10, 0))
         frame.columnconfigure(1, weight=1)
 
     def apply_settings(self):
@@ -1563,6 +1625,8 @@ class TrayApplication:
             settings = dict(self.shared["values"])
         try:
             save_settings(settings)
+            if self.icon is not None:
+                self.icon.menu = self._build_menu()
             print("Réglages enregistrés.")
         except OSError as exc:
             self.messagebox.showerror("Follow Me", f"Enregistrement impossible : {exc}")
@@ -1600,7 +1664,56 @@ class TrayApplication:
             enabled = self.shared["values"]["zoom_enabled"]
             snapshot = dict(self.shared["values"])
         save_settings(snapshot)
+        if self.icon is not None:
+            self.icon.menu = self._build_menu()
         print(f"Zoom automatique {'activé' if enabled else 'désactivé'}.")
+
+    def _hide_preview(self):
+        """Masque la fenêtre d'aperçu sans la détruire."""
+        self.preview_window.withdraw()
+        with self.shared["lock"]:
+            self.shared["values"]["preview"] = False
+        save_settings(dict(self.shared["values"]))
+        if self.icon is not None:
+            self.icon.menu = self._build_menu()
+
+    def _toggle_virtual_video(self):
+        """Active/désactive le partage vers v4l2loopback."""
+        with self.shared["lock"]:
+            values = self.shared["values"]
+            values["virtual_video"] = not values.get("virtual_video", False)
+            enabled = values["virtual_video"]
+            snapshot = dict(values)
+        save_settings(snapshot)
+        if self.icon is not None:
+            self.icon.menu = self._build_menu()
+        print(f"VirtualVideo {'activée' if enabled else 'désactivée'}.")
+
+    def _toggle_preview(self):
+        """Active/désactive l'aperçu vidéo."""
+        with self.shared["lock"]:
+            self.shared["values"]["preview"] = not self.shared["values"]["preview"]
+            enabled = self.shared["values"]["preview"]
+            snapshot = dict(self.shared["values"])
+        save_settings(snapshot)
+        if self.icon is not None:
+            self.icon.menu = self._build_menu()
+        if not enabled:
+            try:
+                if self.preview_label.winfo_exists():
+                    self.preview_window.withdraw()
+            except self.tk.TclError:
+                pass
+        print(f"Aperçu vidéo {'activé' if enabled else 'désactivé'}.")
+
+    def _rebuild_preview(self):
+        """Recrée la fenêtre d'aperçu si elle a été détruite."""
+        self.preview_window = self.tk.Toplevel(self.root)
+        self.preview_window.title("Follow Me — Aperçu")
+        self.preview_window.protocol("WM_DELETE_WINDOW", self._hide_preview)
+        self.preview_label = self.tk.Label(self.preview_window, text="Aperçu en attente…")
+        self.preview_label.pack(padx=8, pady=8)
+        self.preview_photo = None
 
     def _reset(self):
         try:
@@ -1616,20 +1729,29 @@ class TrayApplication:
         draw.arc((13, 24, 51, 54), 15, 165, fill="white", width=4)
         return image
 
-    def _menu(self):
+    def _build_menu(self):
+        """Construit le menu du tray avec l'état actuel des options."""
         pystray = self.pystray
+        with self.shared["lock"]:
+            zoom_enabled = bool(self.shared["values"]["zoom_enabled"])
+            preview_enabled = bool(self.shared["values"]["preview"])
+            virtual_enabled = bool(self.shared["values"].get("virtual_video", False))
+        zoom_text = "Zoom automatique : Activé" if zoom_enabled else "Zoom automatique : Désactivé"
+        preview_text = "Aperçu vidéo : Activé" if preview_enabled else "Aperçu vidéo : Désactivé"
+        virtual_text = "VirtualVideo : Activée" if virtual_enabled else "VirtualVideo : Désactivée"
         return pystray.Menu(
             pystray.MenuItem("Démarrer le suivi", lambda icon, item: self.commands.put("start")),
             pystray.MenuItem("Arrêter le suivi", lambda icon, item: self.commands.put("stop")),
-            pystray.MenuItem("Zoom automatique", lambda icon, item: self.commands.put("zoom"),
-                             checked=lambda item: self.shared["values"]["zoom_enabled"]),
+            pystray.MenuItem(zoom_text, lambda icon, item: self.commands.put("zoom")),
+            pystray.MenuItem(preview_text, lambda icon, item: self.commands.put("preview")),
+            pystray.MenuItem(virtual_text, lambda icon, item: self.commands.put("virtual_video")),
             pystray.MenuItem("Réinitialiser pan/tilt", lambda icon, item: self.commands.put("reset")),
             pystray.MenuItem("Réglages…", lambda icon, item: self.commands.put("settings")),
             pystray.MenuItem("Quitter", lambda icon, item: self.commands.put("quit")),
         )
 
     def _run_icon(self):
-        self.icon = self.pystray.Icon("Logitech-QuickCam-Sphere-NixOs", self._icon_image(), "Follow Me", self._menu())
+        self.icon = self.pystray.Icon("follow_me", self._icon_image(), "Follow Me", menu=self._build_menu())
         try:
             self.icon.run()
         except Exception as exc:
@@ -1650,6 +1772,10 @@ class TrayApplication:
                 self._stop_tracking()
             elif command == "zoom":
                 self._toggle_zoom()
+            elif command == "preview":
+                self._toggle_preview()
+            elif command == "virtual_video":
+                self._toggle_virtual_video()
             elif command == "reset":
                 self._reset()
             elif command == "settings":
@@ -1665,15 +1791,26 @@ class TrayApplication:
         except queue.Empty:
             frame = None
 
+        # Respecter le réglage live de l'aperçu
+        with self.shared["lock"]:
+            preview_enabled = bool(self.shared["values"]["preview"])
+
         try:
-            if frame is not None and self.preview_label.winfo_exists():
+            if frame is not None and preview_enabled:
+                # Recréer la fenêtre si elle a été détruite
+                if not self.preview_label.winfo_exists():
+                    self._rebuild_preview()
                 image = self.Image.fromarray(frame[:, :, ::-1])
                 self.preview_photo = self.ImageTk.PhotoImage(image=image)
                 self.preview_label.configure(image=self.preview_photo, text="")
                 if not self.preview_window.winfo_viewable():
                     self.preview_window.deiconify()
+            elif not preview_enabled:
+                # Masquer l'aperçu si désactivé
+                if self.preview_label.winfo_exists() and self.preview_window.winfo_viewable():
+                    self.preview_window.withdraw()
         except self.tk.TclError:
-            return  # fenêtre détruite pendant l'arrêt
+            return
 
         self._after_id = self.root.after(150, self._poll_commands)
 
@@ -1775,7 +1912,7 @@ def build_service_unit(args):
         f"{SERVICE_SHELL} --run {shlex.quote('python ' + inner)}"
     )
     return f"""[Unit]
-Description=Suivi de visage PTZ (Logitech-QuickCam-Sphere-NixOs)
+Description=Suivi de visage PTZ (follow_me)
 PartOf=graphical-session.target
 After=graphical-session.target
 
@@ -1822,7 +1959,7 @@ def install_service(args):
     print(f"Service activé et démarré : systemctl --user status {SERVICE_NAME}")
     print("Note : le service démarre avec la session graphique ; "
           "pour les réglages, lance le script normalement (tray) ou édite "
-          "~/.config/Logitech-QuickCam-Sphere-NixOs/settings.json.")
+          "~/.config/follow_me/settings.json.")
 
 
 def uninstall_service():
@@ -1836,16 +1973,16 @@ def uninstall_service():
         pass
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "reset-failed"], check=False)
-    print("Service follow-me supprimé (les fichiers dans ~/.local/share/Logitech-QuickCam-Sphere-NixOs "
+    print("Service follow-me supprimé (les fichiers dans ~/.local/share/follow_me "
           "et les réglages sont conservés).")
 
 def close_previous_instances():
-    """Ferme les autres scripts Logitech-QuickCam-Sphere-NixOs du même utilisateur."""
+    """Ferme les autres scripts follow_me du même utilisateur."""
     current_pid = os.getpid()
     current_uid = os.getuid()
     username = getpass.getuser()
 
-    def is_logitech_quickcam_sphere_nixos(pid):
+    def is_follow_me(pid):
         try:
             with open(f"/proc/{pid}/status", encoding="utf-8") as stream:
                 status = stream.read()
@@ -1857,15 +1994,15 @@ def close_previous_instances():
         except (OSError, StopIteration, ValueError):
             return False
         executable = os.path.basename(argv[0]) if argv else ""
-        if executable.startswith("Logitech-QuickCam-Sphere-NixOs") and executable.endswith(".py"):
+        if executable.startswith("follow_me") and executable.endswith(".py"):
             return True
         for index, argument in enumerate(argv[1:], 1):
             name = os.path.basename(argument)
             if argument == "-m" and index + 1 < len(argv):
                 module = argv[index + 1].split(".", 1)[0]
-                if module == "Logitech-QuickCam-Sphere-NixOs":
+                if module == "follow_me":
                     return True
-            if name == "Logitech-QuickCam-Sphere-NixOs" or (name.startswith("Logitech-QuickCam-Sphere-NixOs") and name.endswith(".py")):
+            if name == "follow_me" or (name.startswith("follow_me") and name.endswith(".py")):
                 return True
         return False
 
@@ -1873,7 +2010,7 @@ def close_previous_instances():
     try:
         pids = (int(entry) for entry in os.listdir("/proc") if entry.isdigit())
         for pid in pids:
-            if pid != current_pid and is_logitech_quickcam_sphere_nixos(pid):
+            if pid != current_pid and is_follow_me(pid):
                 previous.append(pid)
     except OSError as exc:
         print(f"[AVERTISSEMENT] Lecture de /proc impossible : {exc}", file=sys.stderr)
@@ -1881,7 +2018,7 @@ def close_previous_instances():
 
     if not previous:
         return
-    print(f"Fermeture de {len(previous)} instance(s) Logitech-QuickCam-Sphere-NixOs précédente(s) de {username}.")
+    print(f"Fermeture de {len(previous)} instance(s) follow_me précédente(s) de {username}.")
     for pid in previous:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -1893,11 +2030,11 @@ def close_previous_instances():
     deadline = time.monotonic() + 2.0
     pending = set(previous)
     while pending and time.monotonic() < deadline:
-        pending = {pid for pid in pending if is_Logitech-QuickCam-Sphere-NixOs(pid)}
+        pending = {pid for pid in pending if is_follow_me(pid)}
         if pending:
             time.sleep(0.1)
     for pid in pending:
-        if is_Logitech-QuickCam-Sphere-NixOs(pid):
+        if is_follow_me(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):

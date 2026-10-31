@@ -1,6 +1,6 @@
 # Follow Me — suivi de visage pour caméra PTZ
 
-**Follow Me** est un script Python qui repère un visage dans le flux vidéo d’une caméra et pilote ses axes **pan/tilt** pour le garder dans le champ. Il utilise OpenCV et le modèle de détection YuNet, et commande les moteurs par les contrôles **V4L2** du noyau Linux. La version la plus complète fournie ajoute un zoom automatique, une icône de zone de notification avec réglages, ainsi qu’une installation optionnelle comme service utilisateur systemd sous NixOS.Le développement a été fait avec une très veille Logitech QuickCam Sphere.
+**Follow Me** est un script Python qui repère un visage dans le flux vidéo d’une caméra et pilote ses axes **pan/tilt** pour le garder dans le champ. Il utilise OpenCV et le modèle de détection YuNet, et commande les moteurs par les contrôles **V4L2** du noyau Linux. La version la plus complète fournie ajoute un zoom automatique, une icône de zone de notification avec réglages, ainsi qu’une installation optionnelle comme service utilisateur systemd sous NixOS.
 
 > **État du projet :** prototype dépendant du matériel, des contrôles V4L2 exposés par la caméra, du pilote et de la session graphique. Les fichiers fournis ne contiennent ni tests automatisés ni matrice de compatibilité matérielle. Vérifiez les contrôles et essayez d’abord le lancement interactif avant d’installer le service.
 
@@ -34,6 +34,8 @@ Le modèle et ses conditions de redistribution sont distincts du code de ce dép
 
 ## Installation et premier lancement
 
+Les exemples ci-dessous utilisent le fichier **v0.7** fourni, `follow_me_7.py`. Si le dépôt publie la version sélectionnée sous le nom `follow_me.py`, remplacez ce nom dans les commandes. La dernière version peut relancer automatiquement un shell Nix sur NixOS en cas de dépendances absentes ; hors NixOS, installez vous-même les dépendances système et Python ci-dessus.
+
 Vérifiez d’abord les périphériques identifiés :
 
 ```sh
@@ -54,7 +56,7 @@ Le script réinitialise les moteurs au démarrage, sauf si `--no-start-reset` es
 Arrêt : `Ctrl+C`, ou la touche `q` lorsque l’aperçu est ouvert. Pour la liste des options et leurs valeurs par défaut :
 
 ```sh
-python3 Logitech-QuickCam-Sphere-NixOs.py --help
+python3 follow_me_7.py --help
 ```
 
 ### Réglages courants
@@ -79,15 +81,10 @@ Consultez `--help` : l’ensemble des options varie entre les versions historiqu
 
 ## Service utilisateur systemd sous NixOS (v0.7)
 
-Quick setup
-```sh
-python3 follow-me-QuickCam-NixOs.py --install-service
-```
-
 L’installation est prévue pour NixOS avec `nix-shell` et une session graphique utilisateur. Les options supplémentaires fournies à l’installation sont inscrites dans la commande du service ; utilisez donc ici un mode sans zone de notification si vous le souhaitez :
 
 ```sh
-python3 follow-me-QuickCam-NixOs.py --install-service --no-tray --no-reset --max-delta 200
+python3 follow_me_7.py --install-service --no-tray --no-reset --max-delta 200
 systemctl --user status follow-me
 journalctl --user -u follow-me -f
 ```
@@ -97,23 +94,27 @@ La commande installe une copie du script et le shell Nix sous `~/.local/share/fo
 Pour désinstaller l’unité :
 
 ```sh
-python3 follow-me-QuickCam-NixOs.py --uninstall-service
+python3 follow_me_7.py --uninstall-service
 ```
 
 La désinstallation arrête/désactive le service et supprime l’unité systemd, mais conserve les fichiers sous `~/.local/share/follow_me/` et les réglages. Pour gérer les réglages, lancez le script en mode interactif ou modifiez `~/.config/follow_me/settings.json`.
 
 ## Versions historiques fournies
 
-| Version | Évolution visible dans les fichiers fournis |
+La série décrit l’évolution du script, pas sept implémentations toutes distinctes : les fichiers `follow_me_1.py` et `follow_me_2.py` fournis sont identiques octet pour octet ; le fichier `Logitech-QuickCam-Sphere-NixOs.py` est identique à `follow_me_7.py`.
+
+| Version | Évolution visible  |
 |---|---|
-| **v0.1** (`follow_me_1.py`) | Draft des version de pécédentes basé sur des test de fichiers paramètre avec une vielle Logitech-QuickCam-Sphere |
-| **v0.2** (`follow_me_2.py`) | Suivi facial PTZ V4L2, aperçu en option, contrôles de caméra et bootstrap des dépendances sur NixOS. |
-| **v0.3** (`follow_me_3.py`) | Ajout du zoom automatique : détection des contrôles de zoom V4L2 et zoom numérique de repli, avec paramètres de cible et de limite. |
-| **v0.4** (`follow_me_4.py`) | Ajout de l’interface de zone de notification, des réglages enregistrés et actualisables, et du shell Nix enrichi en dépendances graphiques. |
-| **v0.5** (`follow_me_5.py`) | Refonte de l’aperçu pour l’intégrer aux boucles Tkinter, ajout d’un mode aperçu console et de la fermeture des instances précédentes. |
-| **v0.6** (`follow_me_6.py`) | Ajustements du shell Nix et du contrôle des dépendances, prise en compte des réglages d’inversion à chaud et robustesse accrue de l’arrêt de l’interface. |
-| **v0.7** (`follow_me_7.py`) | Ajout de l’installation/désinstallation du service utilisateur systemd sous NixOS, démarré avec la session graphique. 
-|`follow-me-QuickCam-NixOs.py` |La dernière version (0.7). |
+| **v0.1** | Basic functions |
+| **v0.2** | Suivi facial PTZ V4L2, aperçu en option, contrôles de caméra et bootstrap des dépendances sur NixOS. |
+| **v0.3** | Ajout du zoom automatique : détection des contrôles de zoom V4L2 et zoom numérique de repli, avec paramètres de cible et de limite. |
+| **v0.4** | Ajout de l’interface de zone de notification, des réglages enregistrés et actualisables, et du shell Nix enrichi en dépendances graphiques. |
+| **v0.5** | Refonte de l’aperçu pour l’intégrer aux boucles Tkinter, ajout d’un mode aperçu console et de la fermeture des instances précédentes. |
+| **v0.6** | Ajustements du shell Nix et du contrôle des dépendances, prise en compte des réglages d’inversion à chaud et robustesse accrue de l’arrêt de l’interface. |
+| **v0.7** | Ajout de l’installation/désinstallation du service utilisateur systemd sous NixOS, démarré avec la session graphique. 
+| **v0.8** | Ajout de la copie de signal video. 
+
+Le fichier `Logitech-QuickCam-Sphere-NixOs.py` en est une copie identique de la derniere version |
 
 ## Diagnostic et limites
 
@@ -127,3 +128,18 @@ La désinstallation arrête/désactive le service et supprime l’unité systemd
 ## Licence
 
 Le projet est destiné à être publié sous la **GNU General Public License, version 3** (**GNU GPL v3**). Ajoutez au dépôt le fichier `LICENSE` contenant le texte intégral officiel de la GPL-3.0 ; le README seul ne constitue pas le texte de licence. Cette mention concerne le code du projet et ne détermine pas la licence du modèle ONNX ni celles des dépendances tierces.
+
+
+## Nouveautés et notes de version (juillet 2026)
+
+- **NixOS, noyau 7.0.x et v4l2loopback 0.15.3 :** le périphérique vidéo virtuel peut échouer à l’appel `VIDIOC_STREAMON` avec `EIO` sur les noyaux ≥ 7.0. Préférez alors le périphérique physique, identifié sous `/dev/v4l/by-id/...`.
+
+  Exemple pour la caméra Logitech QuickCam Orbit sur NixOS :
+
+  ```sh
+  python3 follow_me_7.py --device /dev/v4l/by-id/usb-046d_081d_XXXX-video-index0 --no-reset --max-delta 200 --preview
+  ```
+
+- **Résolution des collisions de périphériques :** utilisez les chemins stables `/dev/v4l/by-id/` plutôt que `/dev/videoN`, qui peuvent désigner des périphériques différents selon l’ordre de détection.
+- **Fichier de configuration :** `~/.config/follow_me/settings.json` est créé au premier lancement, persiste entre les sessions et survit aux `nixos-rebuild` (les chemins du store Nix sont immuables).
+- **`exclusive_caps=1` avec v4l2loopback :** un seul processus à la fois peut ouvrir le périphérique virtuel. Cette option évite les conflits d’accès avec VLC ou d’autres lecteurs.
