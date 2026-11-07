@@ -1,113 +1,120 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-linux_motorized_camera_driver.py — Suivi de visage avec caméra PTZ V4L2
-linux_motorized_camera_driver.py — Face tracking with a V4L2 PTZ camera
+follow_me.py — Suivi de visage avec une caméra PTZ (V4L2).
 
-AIDE / HELP
+Compatibilité caméra virtuelle : la disponibilité et la compatibilité de
+v4l2loopback dépendent du noyau, de la configuration NixOS et du paquet choisi.
+Vérifier les versions installées sur la machine cible ; ce script ne présume pas
+qu'un module soit disponible ni qu'il fonctionne pour un noyau donné.
+
+
+UTILISATION
 -----------
 
-Afficher toutes les options disponibles / Show all available options:
+Sur NixOS, lancer simplement le script : si des prérequis Python ou des
+commandes système manquent, le script écrit le shell.nix intégré dans un fichier
+temporaire puis se relance dans nix-shell. Sur Debian, les dépendances sont
+vérifiées et les paquets manquants sont indiqués sans installation automatique.
+Le marqueur
+FOLLOW_ME_IN_NIX_SHELL empêche une relance infinie.
 
-    python3 linux_motorized_camera_driver.py --help
+    python3 follow_me.py --no-reset --max-delta 200 --preview
 
-EXEMPLES / EXAMPLES
--------------------
-
-Suivi avec aperçu / Track with preview:
-
-    python3 linux_motorized_camera_driver.py --preview
-
-Choisir une caméra parmi plusieurs / Select a camera when several are detected:
-
-    python3 linux_motorized_camera_driver.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0
-
-Suivi sans recentrage initial logiciel, avec aperçu / Track without the initial
-software centering, with preview:
-
-    python3 linux_motorized_camera_driver.py --no-reset --preview
-
-Désactiver le zoom automatique / Disable automatic zoom:
-
-    python3 linux_motorized_camera_driver.py --no-auto-zoom
-
-Partager le flux avec une caméra virtuelle v4l2loopback /
-Share the video stream through a v4l2loopback virtual camera:
-
-    python3 linux_motorized_camera_driver.py --virtual-video
-
-Lancer en mode terminal, sans icône ni panneau de réglages /
-Run in terminal mode, without a tray icon or settings panel:
-
-    python3 linux_motorized_camera_driver.py --no-tray
-
-DÉPENDANCES ET DÉMARRAGE / DEPENDENCIES AND STARTUP
-----------------------------------------------------
-
-Sur NixOS, si des dépendances Python ou des commandes système manquent,
-le script peut se relancer dans un environnement nix-shell temporaire.
-Il ne modifie pas la configuration NixOS et n’installe pas de paquets de
-façon permanente. Sur Debian, les dépendances manquantes sont indiquées,
-sans installation automatique.
-
-On NixOS, if Python dependencies or system commands are missing, the script
-can relaunch itself in a temporary nix-shell environment. It does not modify
-the NixOS configuration or permanently install packages. On Debian, missing
-dependencies are reported but not installed automatically.
-
-Le modèle YuNet doit être placé dans le dossier du script, ou indiqué avec
---model. Téléchargement / Place the YuNet model next to this script, or
-specify it with --model. Download it with:
+Télécharger le modèle YuNet dans le dossier du script :
 
     curl -L -o face_detection_yunet_2023mar.onnx \
       https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx
 
-CAMÉRA VIRTUELLE / VIRTUAL CAMERA
-----------------------------------
+Si plusieurs caméras PTZ sont détectées :
 
-L’option --virtual-video recopie les images capturées vers un périphérique
-v4l2loopback. Le module doit être disponible pour le noyau actif et chargé ;
-le script ne peut pas garantir sa compatibilité avec une configuration NixOS
-donnée. Si nécessaire, configurez v4l2loopback dans votre système et indiquez
-un périphérique avec --virtual-device.
+    ls -l /dev/v4l/by-id/
+    python3 follow_me.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 \
+      --no-reset --max-delta 200 --preview
 
-The --virtual-video option copies captured frames to a v4l2loopback device.
-The module must be available for the active kernel and loaded. This script
-cannot guarantee compatibility with a particular NixOS configuration. If
-needed, configure v4l2loopback in your system and specify a device with
---virtual-device.
+Au lancement, le script réinitialise les moteurs (désactiver avec
+--no-start-reset), puis ignore 12 images pour stabiliser l'exposition.
+--no-reset désactive séparément le recentrage initial logiciel.
+Le zoom automatique est actif par défaut (--no-auto-zoom pour le couper) ;
+la cible est réglable avec --zoom-target-ratio.
+Le tilt est inversé par défaut. Utiliser --no-invert-tilt pour désactiver
+l'inversion ou --invert-pan pour inverser le pan.
 
-Le script conserve la caméra physique ouverte pour capturer les images et
-commander les moteurs. Les autres applications doivent utiliser le périphérique
-virtuel, et non la caméra physique. Une seule application peut ouvrir la
-caméra physique à la fois.
+CAMÉRA VIRTUELLE (VirtualVideo)
+-------------------------------
 
-The script keeps the physical camera open for capture and PTZ control. Other
-applications must use the virtual device, not the physical camera. Only one
-application can open the physical camera at a time.
 
-SERVICE UTILISATEUR / USER SERVICE
------------------------------------
+Une seule application peut ouvrir la vraie caméra à la fois. Avec
+VirtualVideo (activée via --virtual-video, l'entrée VirtualVideo du menu
+tray ou la case "VirtualVideo (partager le flux)" des réglages), le script
+recopie le flux capturé vers une caméra virtuelle v4l2loopback : les
+autres logiciels (VLC, Cheese, navigateur, Zoom…) lisent alors la copie
+tandis que le script garde la vraie caméra pour le pilotage PTZ.
 
-Installer et démarrer le service systemd utilisateur /
-Install and start the systemd user service:
+Prérequis : le module kernel v4l2loopback doit être chargé avec un
+périphérique configuré. Exemple NixOS à adapter dans configuration.nix :
 
-    python3 linux_motorized_camera_driver.py --install-service
+    boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
+    boot.kernelModules = [ "v4l2loopback" ];
+    boot.extraModprobeConfig = ''
+      options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=1
+    '';
 
-Afficher l’état et les journaux / Check status and logs:
+Cet attribut de paquet peut ne pas exister pour chaque noyau/canal NixOS :
+vérifie sa présence et sa compatibilité avec le noyau effectivement sélectionné
+avant d'ajouter la configuration. Ce script ne vérifie pas le catalogue NixOS
+et ne peut garantir que le module soit disponible ou chargeable sur ta machine.
+Reconstruire et redémarrer (ou temporairement : sudo modprobe
+v4l2loopback devices=1 video_nr=10 card_label="CamPartagee"
+exclusive_caps=1). Le module doit être chargé avant le démarrage de la
+session graphique et donc avant le service utilisateur follow-me. Ajouter
+aussi l'utilisateur au groupe video (NixOS :
+users.users.<nom>.extraGroups = [ "video" ];), puis fermer/réouvrir la
+session pour que le gestionnaire systemd utilisateur hérite du groupe.
+Les autres applications ouvrent ensuite /dev/video10 :
 
-    systemctl --user status follow-me
-    journalctl --user -u follow-me -f
+    vlc v4l2:///dev/video10
 
-Désinstaller le service / Uninstall the service:
+Si l'option est demandée mais qu'aucun périphérique loopback n'est
+trouvé, un avertissement détaillé (bloc d'explication avec la
+configuration NixOS ci-dessus) est affiché et le suivi continue sans
+partage. Le nœud loopback est détecté automatiquement ; --virtual-device
+permet de l'imposer.
 
-    python3 linux_motorized_camera_driver.py --uninstall-service
+Diagnostic :
 
-Arrêt : Ctrl+C, ou la touche q lorsque l’aperçu est actif.
-Quit: Ctrl+C, or press q while the preview is active.
+    v4l2-ctl --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 --list-ctrls
+    v4l2-ctl --list-devices
 
-Pour la liste complète des options, utiliser --help.
-For the complete list of options, run --help.
+Important : la copie ne libère pas le nœud physique. Follow Me garde la
+caméra physique ouverte pour capturer et piloter ; si WhatsApp ouvre ce même
+nœud, « caméra occupée » est attendu. Dans WhatsApp, sélectionner explicitement
+la caméra virtuelle « CamPartagee » (/dev/video10 dans l'exemple), jamais la
+caméra physique. Avec exclusive_caps=1, le loopback n'annonce sa capacité de
+capture qu'une fois le producteur démarré : attendre le message « VirtualVideo
+active », puis fermer/réouvrir le sélecteur caméra de WhatsApp et choisir la
+caméra virtuelle. Si elle n'apparaît pas, vérifier dans
+`v4l2-ctl --list-devices` que /dev/video10 est bien le loopback et que le
+navigateur/WhatsApp a le droit d'accéder aux périphériques vidéo (portail /
+permissions de sandbox éventuels). Certains pilotes n'acceptent pas non plus
+un descripteur de contrôles PTZ et une capture simultanés ; dans ce cas ce
+pilote/cette caméra ne permet pas cette combinaison.
+
+Arrêt : Ctrl+C ou touche q lorsque la prévisualisation est active.
+
+# Installer + démarrer immédiatement (redémarre avec chaque session NixOS) :
+python3 follow_me.py --install-service
+
+# Avec des options persistantes (elles sont figées dans l'unité) :
+python3 follow_me.py --install-service --no-tray --no-reset --max-delta 200
+
+# Vérifier :
+systemctl --user status follow-me
+journalctl --user -u follow-me -f
+
+# Désinstaller :
+python3 follow_me.py --uninstall-service
+
 """
 
 import os
@@ -115,6 +122,7 @@ os.environ.setdefault("PYSTRAY_BACKEND", "appindicator")
 
 import argparse
 import ctypes
+import configparser
 import errno
 import fcntl
 import getpass
@@ -132,6 +140,30 @@ import sys
 import threading
 import time
 import tempfile
+
+# External UI translations live beside this script (safe for NixOS deployments).
+LANGUAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_driver.lng")
+CURRENT_LANGUAGE = "en"
+_TRANSLATIONS = {}
+
+def load_translations():
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read(LANGUAGE_PATH, encoding="utf-8")
+        return {lang: dict(parser.items(lang)) for lang in ("en", "fr") if parser.has_section(lang)}
+    except (OSError, configparser.Error):
+        return {}
+
+def tr(key, **kwargs):
+    """Translate a UI key, falling back to English and then the key itself."""
+    text = _TRANSLATIONS.get(CURRENT_LANGUAGE, {}).get(
+        key, _TRANSLATIONS.get("en", {}).get(key, key))
+    try:
+        return text.format(**kwargs)
+    except (KeyError, ValueError):
+        return text
+
+_TRANSLATIONS = load_translations()
 
 # Dernière image d’aperçu destinée au thread Tkinter.
 PREVIEW_QUEUE = queue.Queue(maxsize=1)
@@ -1281,6 +1313,7 @@ def run_tracking(args, live_settings=None, stop=None):
         args.kp_pan = 6.0 * initial["speed"]
         args.kp_tilt = 4.5 * initial["speed"]
         args.invert_tilt = initial["invert_y"]
+        args.invert_pan = initial.get("invert_pan", args.invert_pan)
         args.preview = initial["preview"]
         args.no_auto_zoom = not initial["zoom_enabled"]
         args.virtual_video = bool(initial.get("virtual_video", False))
@@ -1379,6 +1412,7 @@ def run_tracking(args, live_settings=None, stop=None):
                 args.kp_pan = 6.0 * current["speed"]
                 args.kp_tilt = 4.5 * current["speed"]
                 args.invert_tilt = current["invert_y"]
+                args.invert_pan = current.get("invert_pan", args.invert_pan)
                 args.preview = current["preview"]
                 if "zoom" in locals():
                     zoom.max_zoom = current["zoom_max"]
@@ -1401,8 +1435,7 @@ def run_tracking(args, live_settings=None, stop=None):
             if frame is None:
                 if time.monotonic() - last_frame_at > args.frame_timeout:
                     raise RuntimeError(
-                        "Aucune nouvelle image : caméra bloquée, débranchée "
-                        "ou occupée."
+                        tr("no_new_frame")
                     )
                 stop.wait(0.003)
                 continue
@@ -1570,8 +1603,8 @@ SETTINGS_PATH = os.path.expanduser("~/.config/follow_me/settings.json")
 DEFAULT_SETTINGS = {
     "zoom_max": 3.0, "face_target": 0.25, "speed": 1.0,
     "deadzone_x": 16.0, "deadzone_y": 12.0,
-    "preview": False, "invert_y": True, "zoom_enabled": True,
-    "virtual_video": False,
+    "preview": False, "invert_y": True, "invert_pan": False,
+    "zoom_enabled": True, "virtual_video": False, "language": "en",
 }
 
 # --- V7 : constantes du service ---
@@ -1590,6 +1623,7 @@ def load_settings(args):
                    "preview": bool(args.preview),
                    "zoom_enabled": not args.no_auto_zoom,
                    "invert_y": bool(args.invert_tilt),
+                   "invert_pan": bool(args.invert_pan),
                    "virtual_video": bool(args.virtual_video)})
     try:
         with open(SETTINGS_PATH, encoding="utf-8") as stream:
@@ -1727,14 +1761,14 @@ class TrayApplication:
         self._last_tracking_state = False
         self.closed = threading.Event()
         self.root = tk.Tk()
-        self.root.title("Follow Me — Réglages")
+        self.root.title(tr("settings_title"))
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_settings)
         self.root.withdraw()
         self.preview_window = tk.Toplevel(self.root)
         self.preview_window.protocol("WM_DELETE_WINDOW", self._hide_preview)
-        self.preview_window.title("Follow Me — Aperçu")
-        self.preview_label = tk.Label(self.preview_window, text="Aperçu en attente…")
+        self.preview_window.title(tr("preview_title"))
+        self.preview_label = tk.Label(self.preview_window, text=tr("preview_waiting"))
         self.preview_label.pack(padx=8, pady=8)
         self.preview_photo = None
         self.preview_window.withdraw()
@@ -1746,45 +1780,71 @@ class TrayApplication:
         tk = self.tk
         frame = tk.Frame(self.root, padx=18, pady=14)
         frame.pack(fill="both", expand=True)
-        tk.Label(frame, text="Réglages du suivi", font=("Sans", 14, "bold")).grid(
+        tk.Label(frame, text=tr("settings_heading"), font=("Sans", 14, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        specs = [("zoom_max", "Zoom maximal", 1.0, 8.0, 0.1),
-                 ("face_target", "Taille cible du visage", 0.10, 0.80, 0.01),
-                 ("speed", "Vitesse du suivi", 0.2, 3.0, 0.05),
-                 ("deadzone_x", "Zone morte horizontale (px)", 0, 100, 1),
-                 ("deadzone_y", "Zone morte verticale (px)", 0, 100, 1)]
+        specs = [("zoom_max", "max_zoom", 1.0, 8.0, 0.1),
+                 ("face_target", "face_target", 0.10, 0.80, 0.01),
+                 ("speed", "tracking_speed", 0.2, 3.0, 0.05),
+                 ("deadzone_x", "deadzone_x", 0, 100, 1),
+                 ("deadzone_y", "deadzone_y", 0, 100, 1)]
         with self.shared["lock"]:
             values = dict(self.shared["values"])
-        for row, (key, label, low, high, resolution) in enumerate(specs, 1):
-            tk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=3)
+        for row, (key, label_key, low, high, resolution) in enumerate(specs, 1):
+            tk.Label(frame, text=tr(label_key)).grid(row=row, column=0, sticky="w", pady=3)
             var = tk.DoubleVar(value=values[key])
             self.vars[key] = var
             tk.Scale(frame, variable=var, from_=low, to=high, resolution=resolution,
                      orient="horizontal", length=250, showvalue=True).grid(
                          row=row, column=1, sticky="ew")
-        for row, (key, label) in enumerate((("preview", "Aperçu vidéo"),
-                                             ("invert_y", "Inverser l’axe Y (caméra tête en bas)"),
-                                             ("virtual_video", "VirtualVideo (partager le flux)")), 6):
+        checkbox_specs = (("preview", "preview_video"), ("invert_y", "invert_tilt"),
+                          ("invert_pan", "invert_pan"), ("virtual_video", "virtual_video"))
+        for row, (key, label_key) in enumerate(checkbox_specs, 6):
             var = tk.BooleanVar(value=values[key]); self.vars[key] = var
-            tk.Checkbutton(frame, text=label, variable=var).grid(row=row, column=0,
-                                                                   columnspan=2, sticky="w", pady=3)
-        tk.Button(frame, text="Enregistrer", command=self.apply_settings).grid(
-            row=9, column=0, sticky="w", pady=(10, 0))
-        tk.Button(frame, text="Fermer", command=self.hide_settings).grid(
-            row=9, column=1, sticky="e", pady=(10, 0))
+            tk.Checkbutton(frame, text=tr(label_key), variable=var).grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=3)
+        tk.Label(frame, text=tr("language")).grid(row=10, column=0, sticky="w", pady=3)
+        lang_var = tk.StringVar(value=values.get("language", "en")); self.vars["language"] = lang_var
+        language_menu = tk.OptionMenu(frame, lang_var, "en", "fr")
+        language_menu["menu"].delete(0, "end")
+        language_menu["menu"].add_command(label=tr("english_language"), command=lambda: lang_var.set("en"))
+        language_menu["menu"].add_command(label=tr("french_language"), command=lambda: lang_var.set("fr"))
+        language_menu.grid(row=10, column=1, sticky="w")
+        tk.Button(frame, text=tr("save"), command=self.apply_settings).grid(
+            row=11, column=0, sticky="w", pady=(10, 0))
+        tk.Button(frame, text=tr("close"), command=self.hide_settings).grid(
+            row=11, column=1, sticky="e", pady=(10, 0))
         frame.columnconfigure(1, weight=1)
+
+    def _read_setting_var(self, var):
+        """Read a Tk variable, accepting decimal commas for DoubleVar values."""
+        try:
+            return var.get()
+        except self.tk.TclError:
+            if not isinstance(var, self.tk.DoubleVar):
+                raise
+
+            # DoubleVar.get() asks Tcl to parse its value as a float and raises
+            # before Python can normalize a locale-style decimal comma.
+            try:
+                raw_value = self.root.globalgetvar(var._name)
+            except (self.tk.TclError, AttributeError):
+                raw_value = var._tk.globalgetvar(var._name)
+            return float(str(raw_value).strip().replace(",", "."))
 
     def apply_settings(self):
         with self.shared["lock"]:
-            self.shared["values"].update({key: var.get() for key, var in self.vars.items()})
+            self.shared["values"].update(
+                {key: self._read_setting_var(var) for key, var in self.vars.items()})
             settings = dict(self.shared["values"])
         try:
             save_settings(settings)
+            if settings.get("language", "en") != CURRENT_LANGUAGE:
+                self.messagebox.showinfo(tr("app_name"), tr("language_restart"))
             if self.icon is not None:
                 self.icon.menu = self._build_menu()
-            print("Réglages enregistrés.")
+            print(tr("settings_saved"))
         except OSError as exc:
-            self.messagebox.showerror("Follow Me", f"Enregistrement impossible : {exc}")
+            self.messagebox.showerror(tr("app_name"), tr("save_error", error=exc))
 
     def show_settings(self):
         self.root.deiconify(); self.root.lift()
@@ -1887,9 +1947,9 @@ class TrayApplication:
     def _rebuild_preview(self):
         """Recrée la fenêtre d'aperçu si elle a été détruite."""
         self.preview_window = self.tk.Toplevel(self.root)
-        self.preview_window.title("Follow Me — Aperçu")
+        self.preview_window.title(tr("preview_title"))
         self.preview_window.protocol("WM_DELETE_WINDOW", self._hide_preview)
-        self.preview_label = self.tk.Label(self.preview_window, text="Aperçu en attente…")
+        self.preview_label = self.tk.Label(self.preview_window, text=tr("preview_waiting"))
         self.preview_label.pack(padx=8, pady=8)
         self.preview_photo = None
 
@@ -1911,20 +1971,20 @@ class TrayApplication:
                 pass
         window = self.tk.Toplevel(self.root)
         self.manual_window = window
-        window.title("Follow Me — Pilotage manuel")
+        window.title(tr("manual_title"))
         window.resizable(False, False)
         window.protocol("WM_DELETE_WINDOW", self._close_manual)
         frame = self.tk.Frame(window, padx=14, pady=12)
         frame.pack()
-        self.manual_status = self.tk.Label(frame, text="Connexion à la caméra…", width=34)
+        self.manual_status = self.tk.Label(frame, text=tr("camera_connecting"), width=34)
         self.manual_status.grid(row=0, column=0, columnspan=3, pady=(0, 5))
-        self.tk.Label(frame, text="Maintenir une direction pour déplacer").grid(
+        self.tk.Label(frame, text=tr("hold_direction")).grid(
             row=1, column=0, columnspan=3, pady=(0, 4))
         self.manual_buttons = []
         for row, col, text, pan, tilt in (
-            (2, 1, "Haut", 0, 1), (3, 0, "Gauche", -1, 0),
-            (3, 1, "Arrêt", 0, 0), (3, 2, "Droite", 1, 0),
-            (4, 1, "Bas", 0, -1),
+            (2, 1, tr("up"), 0, 1), (3, 0, tr("left"), -1, 0),
+            (3, 1, tr("stop"), 0, 0), (3, 2, tr("right"), 1, 0),
+            (4, 1, tr("down"), 0, -1),
         ):
             button = self.tk.Button(frame, text=text, width=8, height=2, state="disabled")
             button.grid(row=row, column=col, padx=3, pady=3)
@@ -1936,7 +1996,7 @@ class TrayApplication:
             else:
                 button.configure(command=lambda: self._manual_press(0, 0))
             self.manual_buttons.append(button)
-        center = self.tk.Button(frame, text="Centrer", state="disabled",
+        center = self.tk.Button(frame, text=tr("center"), state="disabled",
                                 command=lambda: self._manual_press(0, 0, center=True))
         center.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(5, 0))
         self.manual_buttons.append(center)
@@ -1944,7 +2004,7 @@ class TrayApplication:
         self._tracking_pending = False
         if self._tracking_is_active():
             self._stop_tracking()
-            self.manual_status.configure(text="Arrêt du suivi avant pilotage manuel…")
+            self.manual_status.configure(text=tr("stopping_tracking"))
         self._advance_modes()
 
     def _manual_press(self, pan, tilt, center=False):
@@ -1984,7 +2044,7 @@ class TrayApplication:
             # Tk du tray continue de lire PREVIEW_QUEUE sans accéder à Tk depuis
             # ce worker, tandis que le descripteur PTZ reste réservé aux commandes.
             cam = FreshCamera(ptz.path, self.args.width, self.args.height, self.args.fps)
-            self.manual_status_queue.put(("ready", f"Caméra connectée ({ptz.mode})."))
+            self.manual_status_queue.put(("ready", tr("camera_connected", mode=ptz.mode)))
             direction = (0, 0)
             last_move = 0.0
             interval = max(0.08, float(self.args.motor_interval))
@@ -2001,9 +2061,9 @@ class TrayApplication:
                     elif command == "center":
                         direction = (0, 0)
                         if not ptz.center():
-                            self.manual_status_queue.put(("message", "Centrage non disponible sur ce mode PTZ."))
+                            self.manual_status_queue.put(("message", tr("center_unavailable")))
                         else:
-                            self.manual_status_queue.put(("message", "Caméra centrée."))
+                            self.manual_status_queue.put(("message", tr("camera_centered")))
                 except queue.Empty:
                     pass
 
@@ -2017,24 +2077,24 @@ class TrayApplication:
                         show_preview(frame, None, None)
                 elif time.monotonic() - last_frame_at > self.args.frame_timeout:
                     raise RuntimeError(
-                        "Aucune nouvelle image : caméra bloquée, débranchée "
-                        "ou occupée."
+                        tr("no_new_frame")
                     )
 
                 now = time.monotonic()
                 if direction != (0, 0) and now - last_move >= interval:
                     with self.shared["lock"]:
                         invert_tilt = bool(self.shared["values"].get("invert_y", True))
+                        invert_pan = bool(self.shared["values"].get("invert_pan", False))
                     try:
                         ptz.move(direction[0] * step, direction[1] * step,
                                  self.args.motor_interval, self.args.max_delta,
-                                 self.args.invert_pan, invert_tilt)
+                                 invert_pan, invert_tilt)
                     except OSError as exc:
-                        self.manual_status_queue.put(("error", f"Mouvement impossible : {exc}"))
+                        self.manual_status_queue.put(("error", tr("move_error", error=exc)))
                         break
                     last_move = now
         except Exception as exc:
-            self.manual_status_queue.put(("error", f"Pilotage manuel impossible : {exc}"))
+            self.manual_status_queue.put(("error", tr("manual_error", error=exc)))
         finally:
             try:
                 if cam is not None:
@@ -2042,7 +2102,7 @@ class TrayApplication:
             finally:
                 if ptz is not None:
                     ptz.close()
-                self.manual_status_queue.put(("stopped", "Pilotage manuel arrêté."))
+                self.manual_status_queue.put(("stopped", tr("manual_stopped")))
 
     def _advance_modes(self):
         if self._manual_pending and not self._tracking_is_active() and not (
@@ -2091,23 +2151,23 @@ class TrayApplication:
             zoom_enabled = bool(self.shared["values"]["zoom_enabled"])
             preview_enabled = bool(self.shared["values"]["preview"])
             virtual_enabled = bool(self.shared["values"].get("virtual_video", False))
-        zoom_text = "Zoom automatique : Activé" if zoom_enabled else "Zoom automatique : Désactivé"
-        preview_text = "Aperçu vidéo : Activé" if preview_enabled else "Aperçu vidéo : Désactivé"
-        virtual_text = "VirtualVideo : Activée" if virtual_enabled else "VirtualVideo : Désactivée"
-        tracking_text = "Arrêter le suivi" if self._tracking_is_active() else "Démarrer le suivi"
+        zoom_text = tr("zoom_on") if zoom_enabled else tr("zoom_off")
+        preview_text = tr("preview_on") if preview_enabled else tr("preview_off")
+        virtual_text = tr("virtual_on") if virtual_enabled else tr("virtual_off")
+        tracking_text = tr("stop_tracking") if self._tracking_is_active() else tr("start_tracking")
         return pystray.Menu(
             pystray.MenuItem(tracking_text, lambda icon, item: self.commands.put("toggle_tracking")),
             pystray.MenuItem(zoom_text, lambda icon, item: self.commands.put("zoom")),
             pystray.MenuItem(preview_text, lambda icon, item: self.commands.put("preview")),
             pystray.MenuItem(virtual_text, lambda icon, item: self.commands.put("virtual_video")),
-            pystray.MenuItem("Pilotage manuel…", lambda icon, item: self.commands.put("manual")),
-            pystray.MenuItem("Réinitialiser pan/tilt", lambda icon, item: self.commands.put("reset")),
-            pystray.MenuItem("Réglages…", lambda icon, item: self.commands.put("settings")),
-            pystray.MenuItem("Quitter", lambda icon, item: self.commands.put("quit")),
+            pystray.MenuItem(tr("manual_menu"), lambda icon, item: self.commands.put("manual")),
+            pystray.MenuItem(tr("reset_menu"), lambda icon, item: self.commands.put("reset")),
+            pystray.MenuItem(tr("settings_menu"), lambda icon, item: self.commands.put("settings")),
+            pystray.MenuItem(tr("quit"), lambda icon, item: self.commands.put("quit")),
         )
 
     def _run_icon(self):
-        self.icon = self.pystray.Icon("follow_me", self._icon_image(), "Follow Me", menu=self._build_menu())
+        self.icon = self.pystray.Icon("follow_me", self._icon_image(), tr("app_name"), menu=self._build_menu())
         try:
             self.icon.run()
         except Exception as exc:
@@ -2224,8 +2284,8 @@ def run_console_preview(args, stop=None):
     from PIL import Image, ImageTk
 
     root = tk.Tk()
-    root.title("Follow Me — Aperçu")
-    label = tk.Label(root, text="Aperçu en attente…")
+    root.title(tr("preview_title"))
+    label = tk.Label(root, text=tr("preview_waiting"))
     label.pack(padx=8, pady=8)
     stop = stop if stop is not None else threading.Event()
     worker_errors = []
@@ -2312,6 +2372,9 @@ def install_service(args):
     os.makedirs(unit_dir, exist_ok=True)
 
     shutil.copy2(os.path.abspath(__file__), SERVICE_SCRIPT)
+    language_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_driver.lng")
+    if os.path.isfile(language_src):
+        shutil.copy2(language_src, os.path.join(SERVICE_DIR, "camera_driver.lng"))
     model_src = DEFAULT_MODEL
     if os.path.isfile(model_src):
         shutil.copy2(model_src, os.path.join(SERVICE_DIR, MODEL_NAME))
@@ -2433,6 +2496,9 @@ def main():
     close_previous_instances()
     need_tray = not args.no_tray
     settings = load_settings(args) if need_tray else None
+    global CURRENT_LANGUAGE
+    if settings is not None:
+        CURRENT_LANGUAGE = settings.get("language", "en") if settings.get("language") in ("en", "fr") else "en"
     if need_tray and settings["preview"]:
         args.preview = True
     check_startup_prerequisites(args, need_tray)
