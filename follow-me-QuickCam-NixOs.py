@@ -3,9 +3,10 @@
 r"""
 follow_me.py — Suivi de visage avec une caméra PTZ (V4L2).
 
-Warn kernel Linux 7.0.x :
-v4l2loopback 0.15.3 n'est pas testé/correctement compilé pour le kernel 7.0.x. Les versions 0.15.x du module ont été développées pour les kernels 6.x. 
-Le kernel 7.x a introduit des changements internes dans la couche video4linux2 qui provoquent l'EIO au VIDIOC_STREAMON — le module se charge, crée le device, accepte S_FMT, mais échoue silencieusement au STREAMON.
+Compatibilité caméra virtuelle : la disponibilité et la compatibilité de
+v4l2loopback dépendent du noyau, de la configuration NixOS et du paquet choisi.
+Vérifier les versions installées sur la machine cible ; ce script ne présume pas
+qu'un module soit disponible ni qu'il fonctionne pour un noyau donné.
 
 
 UTILISATION
@@ -40,8 +41,6 @@ l'inversion ou --invert-pan pour inverser le pan.
 CAMÉRA VIRTUELLE (VirtualVideo)
 -------------------------------
 
-- v4l2loopbackNixOS n'a que la 0.15.3, même pour les kernels 7.x.
-Le problème est confirmé : c'est la version du module qui est le goulot.
 
 Une seule application peut ouvrir la vraie caméra à la fois. Avec
 VirtualVideo (activée via --virtual-video, l'entrée VirtualVideo du menu
@@ -51,15 +50,19 @@ autres logiciels (VLC, Cheese, navigateur, Zoom…) lisent alors la copie
 tandis que le script garde la vraie caméra pour le pilotage PTZ.
 
 Prérequis : le module kernel v4l2loopback doit être chargé avec un
-périphérique configuré. Sur NixOS, déclarer dans configuration.nix :
+périphérique configuré. Exemple NixOS à adapter dans configuration.nix :
 
     boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
     boot.kernelModules = [ "v4l2loopback" ];
     boot.extraModprobeConfig = ''
-      options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=0
+      options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=1
     '';
 
-puis reconstruire et redémarrer (ou temporairement : sudo modprobe
+Cet attribut de paquet peut ne pas exister pour chaque noyau/canal NixOS :
+vérifie sa présence et sa compatibilité avec le noyau effectivement sélectionné
+avant d'ajouter la configuration. Ce script ne vérifie pas le catalogue NixOS
+et ne peut garantir que le module soit disponible ou chargeable sur ta machine.
+Reconstruire et redémarrer (ou temporairement : sudo modprobe
 v4l2loopback devices=1 video_nr=10 card_label="CamPartagee"
 exclusive_caps=1). Le module doit être chargé avant le démarrage de la
 session graphique et donc avant le service utilisateur follow-me. Ajouter
@@ -79,9 +82,21 @@ permet de l'imposer.
 Diagnostic :
 
     v4l2-ctl --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 --list-ctrls
+    v4l2-ctl --list-devices
 
-Le script ouvre deux fois le même nœud : une fois pour les contrôles PTZ
-et une fois pour la capture vidéo (dépend du pilote V4L2).
+Important : la copie ne libère pas le nœud physique. Follow Me garde la
+caméra physique ouverte pour capturer et piloter ; si WhatsApp ouvre ce même
+nœud, « caméra occupée » est attendu. Dans WhatsApp, sélectionner explicitement
+la caméra virtuelle « CamPartagee » (/dev/video10 dans l'exemple), jamais la
+caméra physique. Avec exclusive_caps=1, le loopback n'annonce sa capacité de
+capture qu'une fois le producteur démarré : attendre le message « VirtualVideo
+active », puis fermer/réouvrir le sélecteur caméra de WhatsApp et choisir la
+caméra virtuelle. Si elle n'apparaît pas, vérifier dans
+`v4l2-ctl --list-devices` que /dev/video10 est bien le loopback et que le
+navigateur/WhatsApp a le droit d'accéder aux périphériques vidéo (portail /
+permissions de sandbox éventuels). Certains pilotes n'acceptent pas non plus
+un descripteur de contrôles PTZ et une capture simultanés ; dans ce cas ce
+pilote/cette caméra ne permet pas cette combinaison.
 
 Arrêt : Ctrl+C ou touche q lorsque la prévisualisation est active.
 
@@ -109,6 +124,7 @@ import errno
 import fcntl
 import getpass
 import glob
+import importlib.util
 import json
 import queue
 import math
@@ -164,25 +180,32 @@ MAX_H = 480
 
 SHELL_NIX = r"""{ pkgs ? import <nixpkgs> {} }:
 let
-  giPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" [
+  # Nixpkgs renamed AppIndicator between channels/profiles; select what exists.
+  appindicator =
+    if pkgs ? libayatana-appindicator then pkgs.libayatana-appindicator
+    else if pkgs ? libappindicator-gtk3 then pkgs.libappindicator-gtk3
+    else null;
+  appindicatorPkgs = pkgs.lib.optional (appindicator != null) appindicator;
+  giPath = pkgs.lib.makeSearchPath "lib/girepository-1.0" ([
     pkgs.gtk3 pkgs.glib pkgs.pango pkgs.gdk-pixbuf pkgs.atk pkgs.harfbuzz
-    pkgs.libayatana-appindicator pkgs.gobject-introspection
-  ];
+    pkgs.gobject-introspection
+  ] ++ appindicatorPkgs);
 in pkgs.mkShell {
   packages = [
     (pkgs.python3.withPackages (ps: [
       (ps.opencv4.override { enableGtk3 = true; })
       ps.numpy ps.pystray ps.pillow ps.tkinter ps.pygobject3
     ]))
-    pkgs.tk pkgs.v4l-utils pkgs.gtk3 pkgs.libayatana-appindicator pkgs.gobject-introspection
+    pkgs.tk pkgs.v4l-utils pkgs.gtk3 pkgs.gobject-introspection
     pkgs.ffmpeg
-  ];
+  ] ++ appindicatorPkgs;
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
-    stdenv.cc.cc.lib zlib libGL glib gtk3 libayatana-appindicator dbus
+    stdenv.cc.cc.lib zlib libGL glib gtk3 dbus
     libxkbcommon fontconfig freetype libxcb libx11 libxext libxrender libxi
     libsm libice wayland
-  ]) + ":/run/opengl-driver/lib";
+  ] ++ appindicatorPkgs) + ":/run/opengl-driver/lib";
   shellHook = ''
+    # Keep GI lookup tied to this shell/profile while preserving inherited paths.
     export GI_TYPELIB_PATH="${giPath}''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
     export QT_QPA_PLATFORM=xcb
     unset QT_STYLE_OVERRIDE
@@ -191,12 +214,15 @@ in pkgs.mkShell {
 """
 
 V4L2LOOPBACK_NIXOS_CONFIG = """\
-# NixOS : déclarer le module kernel, ex. dans configuration.nix :
+# Exemple NixOS : vérifier que cet attribut existe pour le noyau sélectionné.
+{ config, ... }:
+{
 boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
 boot.kernelModules = [ "v4l2loopback" ];
 boot.extraModprobeConfig = ''
   options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=1
 '';
+}
 """
 
 
@@ -215,8 +241,9 @@ def print_virtual_video_warning():
         "fois : tant que ce script la détient, les autres logiciels\n"
         "ne peuvent pas y accéder. Pour leur donner une copie du\n"
         "signal, le module kernel v4l2loopback doit être chargé.\n\n"
-        "--- À ajouter à /etc/nixos/configuration.nix ---\n"
+        "--- Exemple à adapter dans /etc/nixos/configuration.nix ---\n"
         f"{V4L2LOOPBACK_NIXOS_CONFIG}"
+        "Vérifie que l'attribut de paquet existe pour le noyau sélectionné.\n"
         "------------------------------------------------\n\n"
         "Puis :\n"
         "  sudo nixos-rebuild switch   # et redémarrer\n"
@@ -277,9 +304,14 @@ def quick_missing(need_tray=False, need_gui=False):
     if np is None:
         missing.append("module Python numpy")
     if need_tray:
+        # Do not import pystray during the host-Python bootstrap probe: loading
+        # its GTK/AppIndicator backend can emit GUI warnings before nix-shell
+        # has had a chance to provide the intended runtime. The real import is
+        # checked after ensure_nix_environment() in check_startup_prerequisites.
         try:
-            import pystray  # noqa: F401
-        except Exception as exc:
+            if importlib.util.find_spec("pystray") is None:
+                missing.append("module Python pystray")
+        except (ImportError, ValueError) as exc:
             missing.append(f"module Python pystray : {exc}")
         try:
             from PIL import Image, ImageDraw  # noqa: F401
@@ -448,7 +480,9 @@ def check_prerequisites(args):
                 os.path.expanduser(args.virtual_device)
                 if getattr(args, "virtual_device", None) else None) is None:
             warn("VirtualVideo : aucun périphérique v4l2loopback détecté ; "
-                 "voir le bloc d'explication affiché au démarrage du suivi.")
+                 "vérifie que le module et son nœud /dev/videoN sont présents, "
+                 "ou indique-le avec --virtual-device. Voir le bloc d'explication "
+                 "affiché au démarrage du suivi.")
 
     if args.preview:
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
@@ -893,36 +927,50 @@ def reset_camera(device, wait=3.0):
 # Caméra virtuelle (v4l2loopback) — VirtualVideo
 # ----------------------------------------------------------------------
 
+def is_loopback_device(video_node):
+    """Confirme par sysfs qu'un chemin /dev/videoN est bien un v4l2loopback."""
+    base = "/sys/class/video4linux/" + os.path.basename(os.path.realpath(video_node))
+    virtual_root = os.path.realpath("/sys/devices/virtual/video4linux")
+    try:
+        with open(os.path.join(base, "name"), encoding="utf-8") as stream:
+            name = stream.read().strip().lower()
+        sysfs_path = os.path.realpath(base)
+        is_virtual = os.path.commonpath((virtual_root, sysfs_path)) == virtual_root
+    except (OSError, ValueError):
+        return False
+    return is_virtual or "v4l2 loopback" in name
+
+
 def find_loopback_device(preferred=None):
-    """Trouve le /dev/videoN d'un périphérique v4l2loopback."""
+    """Trouve un nœud loopback, et refuse une cible explicite physique."""
     if preferred:
-        return preferred if os.path.exists(preferred) else None
+        return preferred if os.path.exists(preferred) and is_loopback_device(preferred) else None
+
+    # Le champ sysfs "name" est le libellé de la carte (souvent personnalisé
+    # avec card_label), pas le nom du pilote. Il n'inclut donc pas forcément
+    # "v4l2 loopback". Les devices de v4l2loopback sont aussi publiés sous
+    # /sys/devices/virtual/video4linux ; on reconnaît ce chemin indépendamment
+    # du nom de carte. Le test du libellé conserve la compatibilité historique.
+    virtual_root = os.path.realpath("/sys/devices/virtual/video4linux")
     for base in sorted(glob.glob("/sys/class/video4linux/video*")):
-        try:
-            with open(os.path.join(base, "name"), encoding="utf-8") as stream:
-                name = stream.read().lower()
-        except OSError:
+        video_node = "/dev/" + os.path.basename(base)
+        if not os.path.exists(video_node):
             continue
-        if "v4l2 loopback" in name:
-            return "/dev/" + os.path.basename(base)
+        if is_loopback_device(video_node):
+            return video_node
     return None
 
 
 class VirtualFeeder:
-    """Recopie chaque frame capturée vers le périphérique virtuel via ffmpeg.
-
-    Un seul processus peut lire la vraie caméra : FreshCamera la détient pour
-    le pilotage PTZ et ffmpeg reçoit les images BGR via stdin. ffmpeg n'ouvre
-    donc PAS /dev/video0 (cela provoquerait « Device busy ») ; il convertit
-    les images et les écrit en YUYV 4:2:2 dans le périphérique loopback.
-    """
+    """Publish captured BGR frames to the v4l2loopback node via ffmpeg stdin."""
 
     def __init__(self, virtual, width, height, fps):
+        # OpenCV's requested dimensions are advisory; use the first actual frame.
         cmd = [
-            "ffmpeg", "-loglevel", "error",
-            "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", f"{width}x{height}", "-r", str(fps),
-            "-i", "pipe:0",
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-f", "rawvideo", "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}", "-framerate", str(fps),
+            "-i", "pipe:0", "-an", "-c:v", "rawvideo",
             "-pix_fmt", "yuv420p", "-s", f"{width}x{height}",
             "-r", str(fps), "-f", "v4l2", virtual,
         ]
@@ -932,30 +980,50 @@ class VirtualFeeder:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"Lancement de ffmpeg impossible : {exc}") from exc
+        # Fail fast on unsupported formats, permissions, or unavailable output.
+        time.sleep(0.15)
+        if self.proc.poll() is not None:
+            returncode = self.proc.returncode
+            self.stop()
+            raise RuntimeError(
+                f"ffmpeg a quitté au démarrage (code {returncode}); "
+                "vérifie les droits /dev/videoN et le format supporté par v4l2loopback."
+            )
 
     def feed(self, frame):
         if self.proc is None or self.proc.stdin is None:
             return
         try:
             self.proc.stdin.write(frame.tobytes())
-        except (BrokenPipeError, OSError):
-            print("[AVERTISSEMENT] Flux virtuel interrompu ; feeder arrêté.", file=sys.stderr)
+            if self.proc.poll() is not None:
+                raise BrokenPipeError(f"ffmpeg terminé (code {self.proc.returncode})")
+        except (BrokenPipeError, OSError) as exc:
+            print(f"[AVERTISSEMENT] Flux virtuel interrompu : {exc}", file=sys.stderr)
             self.stop()
 
     def stop(self):
         if self.proc is None:
             return
+        proc = self.proc
+        self.proc = None
         try:
-            if self.proc.stdin:
-                self.proc.stdin.close()
+            if proc.stdin:
+                proc.stdin.close()
         except OSError:
             pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
         try:
-            self.proc.terminate()
-            self.proc.wait(timeout=3)
-        except subprocess.SubprocessError:
-            self.proc.kill()
-        self.proc = None
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.wait()
 
 
 # ----------------------------------------------------------------------
@@ -1211,20 +1279,29 @@ def run_tracking(args, live_settings=None, stop=None):
                 print("Zoom déjà à sa valeur de reset.")
 
         cam = FreshCamera(ptz.path, args.width, args.height, args.fps)
+        virtual = None
+        feeder_failed = False
         if getattr(args, "virtual_video", False):
-            virtual = find_loopback_device(
-                os.path.expanduser(args.virtual_device) if args.virtual_device else None)
+            requested_virtual = (os.path.expanduser(args.virtual_device)
+                                 if args.virtual_device else None)
+            virtual = find_loopback_device(requested_virtual)
             if virtual is None:
+                if requested_virtual and os.path.exists(requested_virtual):
+                    print(f"[AVERTISSEMENT] {requested_virtual} n'est pas identifié comme v4l2loopback ; "
+                          "refus de l'ouvrir en sortie (la caméra source est ainsi protégée).",
+                          file=sys.stderr)
                 print_virtual_video_warning()
+                virtual = None
+            elif os.path.realpath(virtual) == os.path.realpath(ptz.path):
+                print("[AVERTISSEMENT] La sortie virtuelle désigne la caméra source ; partage désactivé.",
+                      file=sys.stderr)
+                virtual = None
+                feeder_failed = True
             elif shutil.which("ffmpeg") is None:
                 print("[AVERTISSEMENT] VirtualVideo demandée mais ffmpeg est introuvable ; partage désactivé.",
                       file=sys.stderr)
-            else:
-                try:
-                    feeder = VirtualFeeder(virtual, args.width, args.height, args.fps)
-                    print(f"VirtualVideo active : flux publié vers {virtual}.")
-                except (OSError, RuntimeError) as exc:
-                    print(f"[AVERTISSEMENT] Démarrage VirtualVideo impossible : {exc}", file=sys.stderr)
+                virtual = None
+                feeder_failed = True
 
         last_seq = -1
         last_frame_at = time.monotonic()
@@ -1285,10 +1362,19 @@ def run_tracking(args, live_settings=None, stop=None):
             last_seq = seq
             last_frame_at = time.monotonic()
             frame_index += 1
+            height, width = frame.shape[:2]
+            if virtual is not None and feeder is None and not feeder_failed:
+                try:
+                    feeder = VirtualFeeder(virtual, width, height, args.fps)
+                    print(f"VirtualVideo active : copie {width}x{height} vers {virtual}. "
+                          "Dans WhatsApp, sélectionner ce périphérique virtuel.")
+                except (OSError, RuntimeError) as exc:
+                    feeder_failed = True
+                    print(f"[AVERTISSEMENT] Démarrage VirtualVideo impossible : {exc}",
+                          file=sys.stderr)
             if feeder is not None:
                 feeder.feed(frame)
 
-            height, width = frame.shape[:2]
             if width > MAX_W or height > MAX_H:
                 raise RuntimeError(
                     f"Résolution réelle {width}x{height} supérieure à "
@@ -1570,6 +1656,16 @@ class TrayApplication:
         self.commands = queue.Queue()
         self.worker = None
         self.worker_stop = None
+        self.manual_window = None
+        self.manual_buttons = []
+        self.manual_status = None
+        self.manual_thread = None
+        self.manual_stop = None
+        self.manual_commands = None
+        self.manual_status_queue = queue.Queue()
+        self._manual_pending = False
+        self._tracking_pending = False
+        self._last_tracking_state = False
         self.closed = threading.Event()
         self.root = tk.Tk()
         self.root.title("Follow Me — Réglages")
@@ -1637,8 +1733,31 @@ class TrayApplication:
     def hide_settings(self):
         self.root.withdraw()
 
+    def _tracking_is_active(self):
+        """Retourne l'état réel du suivi, d'après la vie du thread worker."""
+        return self.worker is not None and self.worker.is_alive()
+
+    def _refresh_tracking_menu_if_needed(self):
+        """Rafraîchit le libellé du menu quand l'état réel change."""
+        active = self._tracking_is_active()
+        if active != self._last_tracking_state:
+            self._last_tracking_state = active
+            if self.icon is not None:
+                self.icon.menu = self._build_menu()
+
+    def _toggle_tracking(self):
+        """Bascule le suivi selon l'état effectif du thread de suivi."""
+        if self._tracking_is_active():
+            self._stop_tracking()
+        else:
+            self._start_tracking()
+
     def _start_tracking(self):
-        if self.worker is not None and self.worker.is_alive():
+        if self._tracking_is_active():
+            return
+        if self.manual_thread is not None and self.manual_thread.is_alive():
+            self._tracking_pending = True
+            self._stop_manual(close_window=True)
             return
         self.worker_stop = threading.Event()
         self.worker = threading.Thread(target=self._tracking_worker,
@@ -1721,6 +1840,156 @@ class TrayApplication:
         except Exception as exc:
             print(f"Reset impossible : {exc}", file=sys.stderr)
 
+    def _show_manual(self):
+        """Ouvre le pad; le PTZ manuel démarre après libération du suivi."""
+        if self.manual_window is not None:
+            try:
+                if self.manual_window.winfo_exists():
+                    self.manual_window.deiconify()
+                    self.manual_window.lift()
+                    return
+            except self.tk.TclError:
+                pass
+        window = self.tk.Toplevel(self.root)
+        self.manual_window = window
+        window.title("Follow Me — Pilotage manuel")
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self._close_manual)
+        frame = self.tk.Frame(window, padx=14, pady=12)
+        frame.pack()
+        self.manual_status = self.tk.Label(frame, text="Connexion à la caméra…", width=34)
+        self.manual_status.grid(row=0, column=0, columnspan=3, pady=(0, 5))
+        self.tk.Label(frame, text="Maintenir une direction pour déplacer").grid(
+            row=1, column=0, columnspan=3, pady=(0, 4))
+        self.manual_buttons = []
+        for row, col, text, pan, tilt in (
+            (2, 1, "Haut", 0, 1), (3, 0, "Gauche", -1, 0),
+            (3, 1, "Arrêt", 0, 0), (3, 2, "Droite", 1, 0),
+            (4, 1, "Bas", 0, -1),
+        ):
+            button = self.tk.Button(frame, text=text, width=8, height=2, state="disabled")
+            button.grid(row=row, column=col, padx=3, pady=3)
+            if pan or tilt:
+                button.bind("<ButtonPress-1>",
+                            lambda _event, p=pan, t=tilt: self._manual_press(p, t))
+                button.bind("<ButtonRelease-1>", lambda _event: self._manual_press(0, 0))
+                button.bind("<Leave>", lambda _event: self._manual_press(0, 0))
+            else:
+                button.configure(command=lambda: self._manual_press(0, 0))
+            self.manual_buttons.append(button)
+        center = self.tk.Button(frame, text="Centrer", state="disabled",
+                                command=lambda: self._manual_press(0, 0, center=True))
+        center.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        self.manual_buttons.append(center)
+        self._manual_pending = True
+        self._tracking_pending = False
+        if self._tracking_is_active():
+            self._stop_tracking()
+            self.manual_status.configure(text="Arrêt du suivi avant pilotage manuel…")
+        self._advance_modes()
+
+    def _manual_press(self, pan, tilt, center=False):
+        if self.manual_commands is not None:
+            self.manual_commands.put(("center" if center else "move", pan, tilt))
+
+    def _set_manual_controls(self, enabled):
+        for button in self.manual_buttons:
+            try:
+                button.configure(state="normal" if enabled else "disabled")
+            except self.tk.TclError:
+                pass
+
+    def _close_manual(self):
+        self._manual_pending = False
+        self._stop_manual(close_window=True)
+
+    def _stop_manual(self, close_window=False):
+        if self.manual_stop is not None:
+            self.manual_stop.set()
+        if self.manual_commands is not None:
+            self.manual_commands.put(("stop", 0, 0))
+        if close_window and self.manual_window is not None:
+            try:
+                self.manual_window.destroy()
+            except self.tk.TclError:
+                pass
+            self.manual_window = None
+
+    def _manual_worker(self):
+        ptz = None
+        try:
+            ptz = select_camera(self.args.device)
+            self.manual_status_queue.put(("ready", f"Caméra connectée ({ptz.mode})."))
+            direction = (0, 0)
+            last_move = 0.0
+            interval = max(0.08, float(self.args.motor_interval))
+            step = min(50.0, float(self.args.max_delta))
+            while not self.manual_stop.is_set():
+                try:
+                    command, pan, tilt = self.manual_commands.get(timeout=0.03)
+                    if command == "stop":
+                        direction = (0, 0)
+                    elif command == "move":
+                        direction = (pan, tilt)
+                    elif command == "center":
+                        direction = (0, 0)
+                        if not ptz.center():
+                            self.manual_status_queue.put(("message", "Centrage non disponible sur ce mode PTZ."))
+                        else:
+                            self.manual_status_queue.put(("message", "Caméra centrée."))
+                except queue.Empty:
+                    pass
+                now = time.monotonic()
+                if direction != (0, 0) and now - last_move >= interval:
+                    with self.shared["lock"]:
+                        invert_tilt = bool(self.shared["values"].get("invert_y", True))
+                    try:
+                        ptz.move(direction[0] * step, direction[1] * step,
+                                 self.args.motor_interval, self.args.max_delta,
+                                 self.args.invert_pan, invert_tilt)
+                    except OSError as exc:
+                        self.manual_status_queue.put(("error", f"Mouvement impossible : {exc}"))
+                        break
+                    last_move = now
+        except Exception as exc:
+            self.manual_status_queue.put(("error", f"Connexion PTZ impossible : {exc}"))
+        finally:
+            if ptz is not None:
+                ptz.close()
+            self.manual_status_queue.put(("stopped", "Pilotage manuel arrêté."))
+
+    def _advance_modes(self):
+        if self._manual_pending and not self._tracking_is_active() and not (
+                self.manual_thread is not None and self.manual_thread.is_alive()):
+            self._manual_pending = False
+            self.manual_stop = threading.Event()
+            self.manual_commands = queue.Queue()
+            self.manual_thread = threading.Thread(target=self._manual_worker,
+                                                  name="pilotage-manuel", daemon=True)
+            self.manual_thread.start()
+        if self._tracking_pending and not (
+                self.manual_thread is not None and self.manual_thread.is_alive()):
+            self._tracking_pending = False
+            self._start_tracking()
+
+    def _poll_manual_status(self):
+        while True:
+            try:
+                kind, text = self.manual_status_queue.get_nowait()
+            except queue.Empty:
+                break
+            if self.manual_status is not None:
+                try:
+                    self.manual_status.configure(text=text)
+                except self.tk.TclError:
+                    pass
+            if kind == "ready":
+                self._set_manual_controls(True)
+            elif kind in ("error", "stopped"):
+                self._set_manual_controls(False)
+            if kind == "error":
+                print(text, file=sys.stderr)
+
     def _icon_image(self):
         image = self.Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         draw = self.ImageDraw.Draw(image)
@@ -1739,12 +2008,13 @@ class TrayApplication:
         zoom_text = "Zoom automatique : Activé" if zoom_enabled else "Zoom automatique : Désactivé"
         preview_text = "Aperçu vidéo : Activé" if preview_enabled else "Aperçu vidéo : Désactivé"
         virtual_text = "VirtualVideo : Activée" if virtual_enabled else "VirtualVideo : Désactivée"
+        tracking_text = "Arrêter le suivi" if self._tracking_is_active() else "Démarrer le suivi"
         return pystray.Menu(
-            pystray.MenuItem("Démarrer le suivi", lambda icon, item: self.commands.put("start")),
-            pystray.MenuItem("Arrêter le suivi", lambda icon, item: self.commands.put("stop")),
+            pystray.MenuItem(tracking_text, lambda icon, item: self.commands.put("toggle_tracking")),
             pystray.MenuItem(zoom_text, lambda icon, item: self.commands.put("zoom")),
             pystray.MenuItem(preview_text, lambda icon, item: self.commands.put("preview")),
             pystray.MenuItem(virtual_text, lambda icon, item: self.commands.put("virtual_video")),
+            pystray.MenuItem("Pilotage manuel…", lambda icon, item: self.commands.put("manual")),
             pystray.MenuItem("Réinitialiser pan/tilt", lambda icon, item: self.commands.put("reset")),
             pystray.MenuItem("Réglages…", lambda icon, item: self.commands.put("settings")),
             pystray.MenuItem("Quitter", lambda icon, item: self.commands.put("quit")),
@@ -1766,10 +2036,8 @@ class TrayApplication:
                 command = self.commands.get_nowait()
             except queue.Empty:
                 break
-            if command == "start":
-                self._start_tracking()
-            elif command == "stop":
-                self._stop_tracking()
+            if command == "toggle_tracking":
+                self._toggle_tracking()
             elif command == "zoom":
                 self._toggle_zoom()
             elif command == "preview":
@@ -1778,6 +2046,8 @@ class TrayApplication:
                 self._toggle_virtual_video()
             elif command == "reset":
                 self._reset()
+            elif command == "manual":
+                self._show_manual()
             elif command == "settings":
                 self.show_settings()
             elif command in ("quit", "tray_error"):
@@ -1785,6 +2055,12 @@ class TrayApplication:
                 return
             if getattr(self, "_closing", False):
                 return
+
+        # Aussi détecte les terminaisons autonomes (erreur, caméra débranchée,
+        # sortie de la boucle) et met à jour le menu après un démarrage/arrêt.
+        self._advance_modes()
+        self._poll_manual_status()
+        self._refresh_tracking_menu_if_needed()
 
         try:
             frame = PREVIEW_QUEUE.get_nowait()
@@ -1828,6 +2104,8 @@ class TrayApplication:
             self._after_id = None
 
         self._stop_tracking()
+        self._manual_pending = False
+        self._stop_manual(close_window=True)
 
         if self.icon is not None:
             try:
@@ -1849,6 +2127,8 @@ class TrayApplication:
         self._stop_tracking()
         if self.worker is not None:
             self.worker.join(timeout=3)
+        if self.manual_thread is not None:
+            self.manual_thread.join(timeout=3)
         self.closed.set()
 
 
