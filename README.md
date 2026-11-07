@@ -113,6 +113,7 @@ La série décrit l’évolution du script, pas sept implémentations toutes dis
 | **v0.6** | Ajustements du shell Nix et du contrôle des dépendances, prise en compte des réglages d’inversion à chaud et robustesse accrue de l’arrêt de l’interface. |
 | **v0.7** | Ajout de l’installation/désinstallation du service utilisateur systemd sous NixOS, démarré avec la session graphique. 
 | **v0.8** | Ajout de la copie de signal video. 
+| **v0.9** | Ajout du pilotage manuel de la camera. 
 
 Le fichier `Logitech-QuickCam-Sphere-NixOs.py` en est une copie identique de la derniere version |
 
