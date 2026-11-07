@@ -1,120 +1,113 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-follow_me.py — Suivi de visage avec une caméra PTZ (V4L2).
+linux_motorized_camera_driver.py — Suivi de visage avec caméra PTZ V4L2
+linux_motorized_camera_driver.py — Face tracking with a V4L2 PTZ camera
 
-Compatibilité caméra virtuelle : la disponibilité et la compatibilité de
-v4l2loopback dépendent du noyau, de la configuration NixOS et du paquet choisi.
-Vérifier les versions installées sur la machine cible ; ce script ne présume pas
-qu'un module soit disponible ni qu'il fonctionne pour un noyau donné.
-
-
-UTILISATION
+AIDE / HELP
 -----------
 
-Sur NixOS, lancer simplement le script : si des prérequis Python ou des
-commandes système manquent, le script écrit le shell.nix intégré dans un fichier
-temporaire puis se relance dans nix-shell. Sur Debian, les dépendances sont
-vérifiées et les paquets manquants sont indiqués sans installation automatique.
-Le marqueur
-FOLLOW_ME_IN_NIX_SHELL empêche une relance infinie.
+Afficher toutes les options disponibles / Show all available options:
 
-    python3 follow_me.py --no-reset --max-delta 200 --preview
+    python3 linux_motorized_camera_driver.py --help
 
-Télécharger le modèle YuNet dans le dossier du script :
+EXEMPLES / EXAMPLES
+-------------------
+
+Suivi avec aperçu / Track with preview:
+
+    python3 linux_motorized_camera_driver.py --preview
+
+Choisir une caméra parmi plusieurs / Select a camera when several are detected:
+
+    python3 linux_motorized_camera_driver.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0
+
+Suivi sans recentrage initial logiciel, avec aperçu / Track without the initial
+software centering, with preview:
+
+    python3 linux_motorized_camera_driver.py --no-reset --preview
+
+Désactiver le zoom automatique / Disable automatic zoom:
+
+    python3 linux_motorized_camera_driver.py --no-auto-zoom
+
+Partager le flux avec une caméra virtuelle v4l2loopback /
+Share the video stream through a v4l2loopback virtual camera:
+
+    python3 linux_motorized_camera_driver.py --virtual-video
+
+Lancer en mode terminal, sans icône ni panneau de réglages /
+Run in terminal mode, without a tray icon or settings panel:
+
+    python3 linux_motorized_camera_driver.py --no-tray
+
+DÉPENDANCES ET DÉMARRAGE / DEPENDENCIES AND STARTUP
+----------------------------------------------------
+
+Sur NixOS, si des dépendances Python ou des commandes système manquent,
+le script peut se relancer dans un environnement nix-shell temporaire.
+Il ne modifie pas la configuration NixOS et n’installe pas de paquets de
+façon permanente. Sur Debian, les dépendances manquantes sont indiquées,
+sans installation automatique.
+
+On NixOS, if Python dependencies or system commands are missing, the script
+can relaunch itself in a temporary nix-shell environment. It does not modify
+the NixOS configuration or permanently install packages. On Debian, missing
+dependencies are reported but not installed automatically.
+
+Le modèle YuNet doit être placé dans le dossier du script, ou indiqué avec
+--model. Téléchargement / Place the YuNet model next to this script, or
+specify it with --model. Download it with:
 
     curl -L -o face_detection_yunet_2023mar.onnx \
       https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx
 
-Si plusieurs caméras PTZ sont détectées :
+CAMÉRA VIRTUELLE / VIRTUAL CAMERA
+----------------------------------
 
-    ls -l /dev/v4l/by-id/
-    python3 follow_me.py --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 \
-      --no-reset --max-delta 200 --preview
+L’option --virtual-video recopie les images capturées vers un périphérique
+v4l2loopback. Le module doit être disponible pour le noyau actif et chargé ;
+le script ne peut pas garantir sa compatibilité avec une configuration NixOS
+donnée. Si nécessaire, configurez v4l2loopback dans votre système et indiquez
+un périphérique avec --virtual-device.
 
-Au lancement, le script réinitialise les moteurs (désactiver avec
---no-start-reset), puis ignore 12 images pour stabiliser l'exposition.
---no-reset désactive séparément le recentrage initial logiciel.
-Le zoom automatique est actif par défaut (--no-auto-zoom pour le couper) ;
-la cible est réglable avec --zoom-target-ratio.
-Le tilt est inversé par défaut. Utiliser --no-invert-tilt pour désactiver
-l'inversion ou --invert-pan pour inverser le pan.
+The --virtual-video option copies captured frames to a v4l2loopback device.
+The module must be available for the active kernel and loaded. This script
+cannot guarantee compatibility with a particular NixOS configuration. If
+needed, configure v4l2loopback in your system and specify a device with
+--virtual-device.
 
-CAMÉRA VIRTUELLE (VirtualVideo)
--------------------------------
+Le script conserve la caméra physique ouverte pour capturer les images et
+commander les moteurs. Les autres applications doivent utiliser le périphérique
+virtuel, et non la caméra physique. Une seule application peut ouvrir la
+caméra physique à la fois.
 
+The script keeps the physical camera open for capture and PTZ control. Other
+applications must use the virtual device, not the physical camera. Only one
+application can open the physical camera at a time.
 
-Une seule application peut ouvrir la vraie caméra à la fois. Avec
-VirtualVideo (activée via --virtual-video, l'entrée VirtualVideo du menu
-tray ou la case "VirtualVideo (partager le flux)" des réglages), le script
-recopie le flux capturé vers une caméra virtuelle v4l2loopback : les
-autres logiciels (VLC, Cheese, navigateur, Zoom…) lisent alors la copie
-tandis que le script garde la vraie caméra pour le pilotage PTZ.
+SERVICE UTILISATEUR / USER SERVICE
+-----------------------------------
 
-Prérequis : le module kernel v4l2loopback doit être chargé avec un
-périphérique configuré. Exemple NixOS à adapter dans configuration.nix :
+Installer et démarrer le service systemd utilisateur /
+Install and start the systemd user service:
 
-    boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
-    boot.kernelModules = [ "v4l2loopback" ];
-    boot.extraModprobeConfig = ''
-      options v4l2loopback devices=1 video_nr=10 card_label="CamPartagee" exclusive_caps=1
-    '';
+    python3 linux_motorized_camera_driver.py --install-service
 
-Cet attribut de paquet peut ne pas exister pour chaque noyau/canal NixOS :
-vérifie sa présence et sa compatibilité avec le noyau effectivement sélectionné
-avant d'ajouter la configuration. Ce script ne vérifie pas le catalogue NixOS
-et ne peut garantir que le module soit disponible ou chargeable sur ta machine.
-Reconstruire et redémarrer (ou temporairement : sudo modprobe
-v4l2loopback devices=1 video_nr=10 card_label="CamPartagee"
-exclusive_caps=1). Le module doit être chargé avant le démarrage de la
-session graphique et donc avant le service utilisateur follow-me. Ajouter
-aussi l'utilisateur au groupe video (NixOS :
-users.users.<nom>.extraGroups = [ "video" ];), puis fermer/réouvrir la
-session pour que le gestionnaire systemd utilisateur hérite du groupe.
-Les autres applications ouvrent ensuite /dev/video10 :
+Afficher l’état et les journaux / Check status and logs:
 
-    vlc v4l2:///dev/video10
+    systemctl --user status follow-me
+    journalctl --user -u follow-me -f
 
-Si l'option est demandée mais qu'aucun périphérique loopback n'est
-trouvé, un avertissement détaillé (bloc d'explication avec la
-configuration NixOS ci-dessus) est affiché et le suivi continue sans
-partage. Le nœud loopback est détecté automatiquement ; --virtual-device
-permet de l'imposer.
+Désinstaller le service / Uninstall the service:
 
-Diagnostic :
+    python3 linux_motorized_camera_driver.py --uninstall-service
 
-    v4l2-ctl --device /dev/v4l/by-id/TON-PERIPHERIQUE-video-index0 --list-ctrls
-    v4l2-ctl --list-devices
+Arrêt : Ctrl+C, ou la touche q lorsque l’aperçu est actif.
+Quit: Ctrl+C, or press q while the preview is active.
 
-Important : la copie ne libère pas le nœud physique. Follow Me garde la
-caméra physique ouverte pour capturer et piloter ; si WhatsApp ouvre ce même
-nœud, « caméra occupée » est attendu. Dans WhatsApp, sélectionner explicitement
-la caméra virtuelle « CamPartagee » (/dev/video10 dans l'exemple), jamais la
-caméra physique. Avec exclusive_caps=1, le loopback n'annonce sa capacité de
-capture qu'une fois le producteur démarré : attendre le message « VirtualVideo
-active », puis fermer/réouvrir le sélecteur caméra de WhatsApp et choisir la
-caméra virtuelle. Si elle n'apparaît pas, vérifier dans
-`v4l2-ctl --list-devices` que /dev/video10 est bien le loopback et que le
-navigateur/WhatsApp a le droit d'accéder aux périphériques vidéo (portail /
-permissions de sandbox éventuels). Certains pilotes n'acceptent pas non plus
-un descripteur de contrôles PTZ et une capture simultanés ; dans ce cas ce
-pilote/cette caméra ne permet pas cette combinaison.
-
-Arrêt : Ctrl+C ou touche q lorsque la prévisualisation est active.
-
-# Installer + démarrer immédiatement (redémarre avec chaque session NixOS) :
-python3 follow_me.py --install-service
-
-# Avec des options persistantes (elles sont figées dans l'unité) :
-python3 follow_me.py --install-service --no-tray --no-reset --max-delta 200
-
-# Vérifier :
-systemctl --user status follow-me
-journalctl --user -u follow-me -f
-
-# Désinstaller :
-python3 follow_me.py --uninstall-service
-
+Pour la liste complète des options, utiliser --help.
+For the complete list of options, run --help.
 """
 
 import os
