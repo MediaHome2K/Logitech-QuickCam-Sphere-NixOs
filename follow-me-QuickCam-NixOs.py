@@ -12,9 +12,11 @@ qu'un module soit disponible ni qu'il fonctionne pour un noyau donné.
 UTILISATION
 -----------
 
-Sur NixOS, lancer simplement le script : si OpenCV ou v4l2-ctl manque,
-le script écrit le shell.nix intégré dans un fichier temporaire puis se
-relance dans nix-shell (venv + opencv-python via pip). Le marqueur
+Sur NixOS, lancer simplement le script : si des prérequis Python ou des
+commandes système manquent, le script écrit le shell.nix intégré dans un fichier
+temporaire puis se relance dans nix-shell. Sur Debian, les dépendances sont
+vérifiées et les paquets manquants sont indiqués sans installation automatique.
+Le marqueur
 FOLLOW_ME_IN_NIX_SHELL empêche une relance infinie.
 
     python3 follow_me.py --no-reset --max-delta 200 --preview
@@ -144,7 +146,7 @@ PREVIEW_QUEUE = queue.Queue(maxsize=1)
 try:
     import cv2
 except ImportError:
-    cv2 = None  # géré par ensure_nix_environment()
+    cv2 = None  # vérifié par check_startup_prerequisites()
 
 try:
     import numpy as np
@@ -192,6 +194,8 @@ let
   ] ++ appindicatorPkgs);
 in pkgs.mkShell {
   packages = [
+    # Keep Python modules on this interpreter's sys.path; standalone system
+    # packages would expose binaries/libraries but not importable Python modules.
     (pkgs.python3.withPackages (ps: [
       (ps.opencv4.override { enableGtk3 = true; })
       ps.numpy ps.pystray ps.pillow ps.tkinter ps.pygobject3
@@ -283,18 +287,53 @@ class V4L2QueryCtrl(ctypes.Structure):
 # Bootstrap NixOS
 # ----------------------------------------------------------------------
 
-def is_nixos():
-    """Détecte NixOS via le marqueur standard ou os-release."""
-    if os.path.exists("/etc/NIXOS"):
-        return True
+def distro_id():
+    """Lit l'identifiant de distribution sans supposer de chemins FHS applicatifs."""
     try:
-        with open("/etc/os-release", encoding="utf-8") as f:
-            return any(line.strip().lower() == "id=nixos" for line in f)
+        with open("/etc/os-release", encoding="utf-8") as stream:
+            for line in stream:
+                key, separator, value = line.partition("=")
+                if separator and key.strip() == "ID":
+                    return value.strip().strip('"\'').lower()
     except OSError:
-        return False
+        pass
+    return ""
 
 
-def quick_missing(need_tray=False, need_gui=False):
+def is_nixos():
+    """Détecte NixOS par os-release et ses marqueurs usuels."""
+    return (distro_id() == "nixos" or os.path.exists("/etc/NIXOS")
+            or os.path.exists("/run/current-system"))
+
+
+# Noms de paquets fournis uniquement à titre d'aide : l'exécutable est toujours
+# recherché dans PATH, car NixOS n'a pas de préfixe /usr/bin garanti.
+COMMAND_PACKAGES = {
+    "v4l2-ctl": ("v4l-utils", "v4l-utils"),
+    "ffmpeg": ("ffmpeg", "ffmpeg"),
+    "systemctl": ("systemd", "systemd"),
+    "nix-shell": ("nix", "nix"),
+    "busctl": ("systemd", "systemd"),
+    "dbus-send": ("dbus", "dbus"),
+}
+
+
+def require_command(name):
+    """Résout une commande via PATH et explique comment la fournir par distro."""
+    executable = shutil.which(name)
+    if executable:
+        return executable
+    apt_package, nix_package = COMMAND_PACKAGES.get(name, (name, name))
+    if is_nixos():
+        guidance = f"NixOS : ajouter {nix_package} à environment.systemPackages ou utiliser nix-shell -p {nix_package}."
+    elif distro_id() in ("debian", "ubuntu", "linuxmint", "pop"):
+        guidance = f"Debian/Ubuntu : installer le paquet avec sudo apt install {apt_package}."
+    else:
+        guidance = f"Installez le paquet fournissant {name} (Debian : sudo apt install {apt_package})."
+    raise RuntimeError(f"Commande requise introuvable dans PATH : {name}. {guidance}")
+
+
+def quick_missing(need_tray=False, need_gui=False, need_virtual_video=False):
     """Prérequis Python/système minimaux, sans afficher de chemin local."""
     missing = []
     if cv2 is None:
@@ -323,6 +362,8 @@ def quick_missing(need_tray=False, need_gui=False):
             missing.append("module Python tkinter")
     if shutil.which("v4l2-ctl") is None:
         missing.append("v4l2-ctl (v4l-utils)")
+    if need_virtual_video and shutil.which("ffmpeg") is None:
+        missing.append("ffmpeg")
     if need_gui and cv2 is not None:
         info = cv2.getBuildInformation()
         if not any(line.strip().startswith(("GTK+:", "GTK:", "QT:")) and "YES" in line
@@ -331,9 +372,9 @@ def quick_missing(need_tray=False, need_gui=False):
     return missing
 
 
-def ensure_nix_environment(need_tray=False, need_gui=False):
+def ensure_nix_environment(need_tray=False, need_gui=False, need_virtual_video=False):
     """Sur NixOS, relance dans le shell Nix intégré si un prérequis manque."""
-    missing = quick_missing(need_tray, need_gui)
+    missing = quick_missing(need_tray, need_gui, need_virtual_video)
     if not missing or os.environ.get("FOLLOW_ME_IN_NIX_SHELL"):
         return
     if not (is_nixos() and shutil.which("nix-shell")):
@@ -344,9 +385,15 @@ def ensure_nix_environment(need_tray=False, need_gui=False):
         stream.write(SHELL_NIX)
     print("NixOS détecté : lancement du shell de dépendances intégré…", file=sys.stderr)
     script = os.path.abspath(__file__)
-    cmd = "python " + " ".join(shlex.quote(arg) for arg in [script, *sys.argv[1:]])
+    # Resolve python3 inside nix-shell so its withPackages environment supplies
+    # cv2/numpy/Pillow/pystray/tkinter. An absolute host-Python path here would
+    # bypass the Nix interpreter even though nix-shell correctly populated PATH.
+    cmd = "python3 " + " ".join(shlex.quote(arg) for arg in [script, *sys.argv[1:]])
     env = {**os.environ, "FOLLOW_ME_IN_NIX_SHELL": "1"}
-    os.execvpe("nix-shell", ["nix-shell", shell_file, "--run", cmd], env)
+    nix_shell = shutil.which("nix-shell")
+    if not nix_shell:
+        return
+    os.execvpe(nix_shell, [nix_shell, shell_file, "--run", cmd], env)
 
 
 def tray_environment_status():
@@ -462,10 +509,13 @@ def check_prerequisites(args):
     elif args.no_start_reset:
         warn("v4l2-ctl absent ; les resets matériels et commandes zoom sont indisponibles.")
     else:
-        fail(
-            "v4l2-ctl absent : installe v4l-utils ; requis pour le reset "
-            "matériel de démarrage (ou utilise --no-start-reset)"
-        )
+        if is_nixos():
+            dependency_advice = ("NixOS : ajoute v4l-utils à environment.systemPackages "
+                                 "ou lance dans nix-shell -p v4l-utils")
+        else:
+            dependency_advice = "Debian : installe v4l-utils avec sudo apt install v4l-utils"
+        fail("v4l2-ctl absent : " + dependency_advice +
+             "; requis pour le reset matériel de démarrage (ou utilise --no-start-reset)")
 
     if args.no_auto_zoom:
         ok("Zoom automatique désactivé par option")
@@ -475,7 +525,12 @@ def check_prerequisites(args):
     # VirtualVideo : signaler tôt l'absence probable de loopback/ffmpeg.
     if getattr(args, "virtual_video", False):
         if shutil.which("ffmpeg") is None:
-            warn("VirtualVideo : ffmpeg absent ; la caméra virtuelle ne pourra pas être alimentée.")
+            if is_nixos():
+                ffmpeg_advice = "ajoute ffmpeg à environment.systemPackages ou utilise nix-shell -p ffmpeg"
+            else:
+                ffmpeg_advice = "installe ffmpeg avec sudo apt install ffmpeg"
+            warn("VirtualVideo : ffmpeg absent ; " + ffmpeg_advice +
+                 "; la caméra virtuelle ne pourra pas être alimentée.")
         if find_loopback_device(
                 os.path.expanduser(args.virtual_device)
                 if getattr(args, "virtual_device", None) else None) is None:
@@ -711,11 +766,11 @@ def select_camera(device):
 def query_zoom_control(device):
     try:
         result = subprocess.run(
-            ["v4l2-ctl", "-d", device, "--list-ctrls"],
+            [require_command("v4l2-ctl"), "-d", device, "--list-ctrls"],
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=5,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
         detail = getattr(exc, "stderr", None)
         return None, (detail.strip() if detail else str(exc))
     controls = {}
@@ -801,7 +856,7 @@ class ZoomController:
     def _read_current(self):
         try:
             readback = subprocess.run(
-                ["v4l2-ctl", "-d", self.device, f"--get-ctrl={self.control}"],
+                [require_command("v4l2-ctl"), "-d", self.device, f"--get-ctrl={self.control}"],
                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=5,
             )
@@ -827,11 +882,11 @@ class ZoomController:
                           self.minimum, highest_valid)
             if value == self.current:
                 return False
-        command = ["v4l2-ctl", "-d", self.device, f"--set-ctrl={self.control}={value}"]
+        command = [require_command("v4l2-ctl"), "-d", self.device, f"--set-ctrl={self.control}={value}"]
         try:
             result = subprocess.run(command, check=True, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, timeout=5)
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             detail = getattr(exc, "stderr", None) or getattr(exc, "stdout", None)
             print(f"[AVERTISSEMENT] Commande {' '.join(command)} échouée : "
                   f"{detail.strip() if detail else exc}", file=sys.stderr)
@@ -909,7 +964,7 @@ def crop_center_zoom(frame, factor):
 
 
 def reset_camera(device, wait=3.0):
-    command = ["v4l2-ctl", "-d", device, "--set-ctrl=pan_reset=1,tilt_reset=1"]
+    command = [require_command("v4l2-ctl"), "-d", device, "--set-ctrl=pan_reset=1,tilt_reset=1"]
     try:
         subprocess.run(command, check=True, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, text=True, timeout=10)
@@ -967,7 +1022,7 @@ class VirtualFeeder:
     def __init__(self, virtual, width, height, fps):
         # OpenCV's requested dimensions are advisory; use the first actual frame.
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            require_command("ffmpeg"), "-hide_banner", "-loglevel", "warning",
             "-f", "rawvideo", "-pixel_format", "bgr24",
             "-video_size", f"{width}x{height}", "-framerate", str(fps),
             "-i", "pipe:0", "-an", "-c:v", "rawvideo",
@@ -978,7 +1033,7 @@ class VirtualFeeder:
         self.proc = None
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
             raise RuntimeError(f"Lancement de ffmpeg impossible : {exc}") from exc
         # Fail fast on unsupported formats, permissions, or unavailable output.
         time.sleep(0.15)
@@ -1571,8 +1626,11 @@ def save_settings(values):
 def check_startup_prerequisites(args, need_tray):
     """Contrôle modules, tray/DBus, v4l2-ctl et capacités YuNet."""
     global cv2, np
-    ensure_nix_environment(need_tray=need_tray, need_gui=bool(args.preview))
-    errors = quick_missing(need_tray=need_tray, need_gui=bool(args.preview))
+    need_virtual_video = bool(getattr(args, "virtual_video", False))
+    ensure_nix_environment(need_tray=need_tray, need_gui=bool(args.preview),
+                           need_virtual_video=need_virtual_video)
+    errors = quick_missing(need_tray=need_tray, need_gui=bool(args.preview),
+                           need_virtual_video=need_virtual_video)
     # pystray est facultatif : main() active le mode console si son import échoue.
     errors = [error for error in errors if error != "module Python pystray"]
     pystray_import_failed = False
@@ -1618,8 +1676,16 @@ def check_startup_prerequisites(args, need_tray):
             advice = "Vérifiez l'installation Nix : opencv4 avec enableGtk3, numpy, pystray, pillow, tk et v4l-utils."
         elif is_nixos():
             advice = "Impossible de démarrer nix-shell automatiquement ; installez opencv4 (enableGtk3), numpy, pystray, pillow, tk et v4l-utils."
+        elif distro_id() in ("debian", "ubuntu", "linuxmint", "pop"):
+            advice = ("Sur Debian/Ubuntu, installez au besoin : sudo apt install "
+                      "python3-opencv python3-numpy v4l-utils ffmpeg python3-pil "
+                      "python3-tk python3-pystray. Une version récente d'OpenCV "
+                      "avec FaceDetectorYN est nécessaire ; le script n'installe "
+                      "pas de paquets automatiquement.")
         else:
-            advice = "Installez les dépendances manquantes (OpenCV YuNet, numpy, v4l-utils et, pour le tray, pystray/Pillow/Tk)."
+            advice = ("Installez OpenCV récent avec YuNet, numpy, v4l-utils et, "
+                      "pour le tray, pystray/Pillow/Tk. Les commandes externes "
+                      "doivent être accessibles dans PATH.")
         raise RuntimeError("Prérequis manquants : " + ", ".join(errors) + ". " + advice)
     print("Vérification des prérequis : modules requis et v4l2-ctl disponibles.")
 
@@ -1632,7 +1698,7 @@ def reset_from_menu(device):
         if len(paths) != 1:
             raise RuntimeError("Choisissez --device si plusieurs nœuds caméra sont présents.")
         target = paths[0]
-    result = subprocess.run(["v4l2-ctl", "-d", target,
+    result = subprocess.run([require_command("v4l2-ctl"), "-d", target,
                              "--set-ctrl=pan_reset=1,tilt_reset=1"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, timeout=10)
@@ -1917,13 +1983,21 @@ class TrayApplication:
 
     def _manual_worker(self):
         ptz = None
+        cam = None
         try:
             ptz = select_camera(self.args.device)
+            # Le mode manuel arrêtait le worker de suivi (et donc sa capture)
+            # avant d'ouvrir PTZ. Garder un FreshCamera dédié ici : le thread
+            # Tk du tray continue de lire PREVIEW_QUEUE sans accéder à Tk depuis
+            # ce worker, tandis que le descripteur PTZ reste réservé aux commandes.
+            cam = FreshCamera(ptz.path, self.args.width, self.args.height, self.args.fps)
             self.manual_status_queue.put(("ready", f"Caméra connectée ({ptz.mode})."))
             direction = (0, 0)
             last_move = 0.0
             interval = max(0.08, float(self.args.motor_interval))
             step = min(50.0, float(self.args.max_delta))
+            last_seq = -1
+            last_frame_at = time.monotonic()
             while not self.manual_stop.is_set():
                 try:
                     command, pan, tilt = self.manual_commands.get(timeout=0.03)
@@ -1939,6 +2013,21 @@ class TrayApplication:
                             self.manual_status_queue.put(("message", "Caméra centrée."))
                 except queue.Empty:
                     pass
+
+                frame, seq = cam.latest(last_seq)
+                if frame is not None:
+                    last_seq = seq
+                    last_frame_at = time.monotonic()
+                    with self.shared["lock"]:
+                        preview_enabled = bool(self.shared["values"].get("preview", False))
+                    if preview_enabled:
+                        show_preview(frame, None, None)
+                elif time.monotonic() - last_frame_at > self.args.frame_timeout:
+                    raise RuntimeError(
+                        "Aucune nouvelle image : caméra bloquée, débranchée "
+                        "ou occupée."
+                    )
+
                 now = time.monotonic()
                 if direction != (0, 0) and now - last_move >= interval:
                     with self.shared["lock"]:
@@ -1952,11 +2041,15 @@ class TrayApplication:
                         break
                     last_move = now
         except Exception as exc:
-            self.manual_status_queue.put(("error", f"Connexion PTZ impossible : {exc}"))
+            self.manual_status_queue.put(("error", f"Pilotage manuel impossible : {exc}"))
         finally:
-            if ptz is not None:
-                ptz.close()
-            self.manual_status_queue.put(("stopped", "Pilotage manuel arrêté."))
+            try:
+                if cam is not None:
+                    cam.close()
+            finally:
+                if ptz is not None:
+                    ptz.close()
+                self.manual_status_queue.put(("stopped", "Pilotage manuel arrêté."))
 
     def _advance_modes(self):
         if self._manual_pending and not self._tracking_is_active() and not (
@@ -2183,14 +2276,23 @@ def run_console_preview(args, stop=None):
     if worker_errors:
         raise worker_errors[0]
 def build_service_unit(args):
-    """Commande de lancement dans le shell Nix, puis unité systemd user."""
+    """Construit le lancement systemd adapté à NixOS ou Debian."""
     extra = [arg for arg in sys.argv[1:]
              if arg not in ("--install-service", "--uninstall-service")]
-    inner = " ".join(shlex.quote(arg) for arg in [SERVICE_SCRIPT, *extra])
-    exec_start = (
-        f"{shlex.quote(shutil.which('nix-shell') or 'nix-shell')} "
-        f"{SERVICE_SHELL} --run {shlex.quote('python ' + inner)}"
-    )
+    if is_nixos():
+        inner = " ".join(shlex.quote(arg) for arg in [SERVICE_SCRIPT, *extra])
+        nix_shell = require_command("nix-shell")
+        exec_start = (
+            f"{shlex.quote(nix_shell)} {shlex.quote(SERVICE_SHELL)} --run "
+            f"{shlex.quote('python3 ' + inner)}"
+        )
+    else:
+        # Debian/systemd : le même interpréteur de l'installation est utilisé,
+        # sans présumer que python soit dans /usr/bin ni requérir nix-shell.
+        python = sys.executable or shutil.which("python3")
+        if not python:
+            raise RuntimeError("Interpréteur Python 3 introuvable.")
+        exec_start = " ".join(shlex.quote(arg) for arg in [python, SERVICE_SCRIPT, *extra])
     return f"""[Unit]
 Description=Suivi de visage PTZ (follow_me)
 PartOf=graphical-session.target
@@ -2208,9 +2310,10 @@ WantedBy=graphical-session.target
 
 
 def install_service(args):
-    """Copie le script + shell.nix, installe et active le service user."""
-    if not is_nixos() or shutil.which("nix-shell") is None:
-        raise RuntimeError("Installation du service prévue pour NixOS avec nix-shell.")
+    """Copie le script et active une unité systemd utilisateur."""
+    require_command("systemctl")
+    if is_nixos():
+        require_command("nix-shell")
     unit_dir = os.path.expanduser("~/.config/systemd/user")
     os.makedirs(SERVICE_DIR, mode=0o700, exist_ok=True)
     os.makedirs(unit_dir, exist_ok=True)
@@ -2224,9 +2327,10 @@ def install_service(args):
         print("[AVERTISSEMENT] Modèle YuNet introuvable à côté du script ; le suivi "
               "ne démarrera pas. Copie-le dans " + SERVICE_DIR, file=sys.stderr)
     os.chmod(SERVICE_SCRIPT, 0o700)
-    with open(SERVICE_SHELL, "w", encoding="utf-8") as stream:
-        stream.write(SHELL_NIX)
-    os.chmod(SERVICE_SHELL, 0o600)
+    if is_nixos():
+        with open(SERVICE_SHELL, "w", encoding="utf-8") as stream:
+            stream.write(SHELL_NIX)
+        os.chmod(SERVICE_SHELL, 0o600)
 
     unit_path = os.path.join(unit_dir, f"{SERVICE_NAME}.service")
     with open(unit_path, "w", encoding="utf-8") as stream:
@@ -2234,8 +2338,8 @@ def install_service(args):
     print(f"Unité écrite : {unit_path}")
     print(f"Script copié : {SERVICE_SCRIPT}")
 
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
+    subprocess.run([require_command("systemctl"), "--user", "daemon-reload"], check=True)
+    subprocess.run([require_command("systemctl"), "--user", "enable", "--now", SERVICE_NAME], check=True)
     print(f"Service activé et démarré : systemctl --user status {SERVICE_NAME}")
     print("Note : le service démarre avec la session graphique ; "
           "pour les réglages, lance le script normalement (tray) ou édite "
@@ -2244,15 +2348,20 @@ def install_service(args):
 
 def uninstall_service():
     """Arrête et supprime le service utilisateur."""
-    subprocess.run(["systemctl", "--user", "disable", "--now", SERVICE_NAME],
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        print("systemctl introuvable dans PATH ; l'unité ne peut pas être arrêtée.",
+              file=sys.stderr)
+        return
+    subprocess.run([systemctl, "--user", "disable", "--now", SERVICE_NAME],
                    check=False)
     unit_path = os.path.expanduser(f"~/.config/systemd/user/{SERVICE_NAME}.service")
     try:
         os.remove(unit_path)
     except FileNotFoundError:
         pass
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "--user", "reset-failed"], check=False)
+    subprocess.run([systemctl, "--user", "daemon-reload"], check=False)
+    subprocess.run([systemctl, "--user", "reset-failed"], check=False)
     print("Service follow-me supprimé (les fichiers dans ~/.local/share/follow_me "
           "et les réglages sont conservés).")
 
